@@ -3,8 +3,7 @@ module github.com/aws/copilot-cli
 go 1.14
 
 require (
-	github.com/AlecAivazis/survey/v2 v2.2.7
-	github.com/Netflix/go-expect v0.0.0-20190729225929-0e00d9168667 // indirect
+	github.com/AlecAivazis/survey/v2 v2.3.3
 	github.com/aws/aws-sdk-go v1.36.31
 	github.com/briandowns/spinner v1.12.0
 	github.com/dustin/go-humanize v1.0.0
@@ -16,7 +15,6 @@ require (
 	github.com/google/go-cmp v0.5.1 // indirect
 	github.com/google/shlex v0.0.0-20150127133951-6f45313302b9
 	github.com/google/uuid v1.2.0
-	github.com/hinshun/vt10x v0.0.0-20180809195222-d55458df857c // indirect
 	github.com/imdario/mergo v0.3.9
 	github.com/lnquy/cron v1.1.1
 	github.com/moby/buildkit v0.7.2
