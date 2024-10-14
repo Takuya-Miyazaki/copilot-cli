@@ -13,6 +13,13 @@ import (
 	"github.com/aws/aws-sdk-go/service/resourcegroupstaggingapi"
 )
 
+const (
+	// ResourceTypeStateMachine is the resource type for the state machine of a job.
+	ResourceTypeStateMachine = "states:stateMachine"
+	// ResourceTypeRDS is the resource type for any rds resources.
+	ResourceTypeRDS = "rds"
+)
+
 type api interface {
 	GetResources(input *resourcegroupstaggingapi.GetResourcesInput) (*resourcegroupstaggingapi.GetResourcesOutput, error)
 }
@@ -40,9 +47,13 @@ func (rg *ResourceGroups) GetResourcesByTags(resourceType string, tags map[strin
 	var resources []*Resource
 	var tagFilter []*resourcegroupstaggingapi.TagFilter
 	for k, v := range tags {
+		var values []*string
+		if v != "" {
+			values = aws.StringSlice([]string{v})
+		}
 		tagFilter = append(tagFilter, &resourcegroupstaggingapi.TagFilter{
 			Key:    aws.String(k),
-			Values: aws.StringSlice([]string{v}),
+			Values: values,
 		})
 	}
 	resourceResp := &resourcegroupstaggingapi.GetResourcesOutput{}

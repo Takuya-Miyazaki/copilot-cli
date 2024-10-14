@@ -3,12 +3,15 @@
 "use strict";
 
 describe("DNS Delegation Handler", () => {
-  const AWS = require("aws-sdk-mock");
+  const r53 = require("@aws-sdk/client-route-53");
+  const{mockClient} = require("aws-sdk-client-mock");
   const LambdaTester = require("lambda-tester").noVersionCheck();
   const sinon = require("sinon");
   const dnsDelegationHandler = require("../lib/dns-delegation");
   const nock = require("nock");
   const ResponseURL = "https://cloudwatch-response-mock.example.com/";
+  const LogGroup = "/aws/lambda/testLambda";
+  const LogStream = "2021/06/28/[$LATEST]9b93a7dca7344adeb193d15c092dbbfd";
 
   let origLog = console.log;
 
@@ -17,13 +20,18 @@ describe("DNS Delegation Handler", () => {
   const testSubDomainName = "test.example.com";
   const testNameServers = ["ns1.com"];
   const testIAMRole = "arn:aws:iam::00000000000:role/DNSDelegationRole";
-
+  const r53Mock = mockClient(r53.Route53Client);
   beforeEach(() => {
     dnsDelegationHandler.withDefaultResponseURL(ResponseURL);
+    dnsDelegationHandler.withDefaultLogGroup(LogGroup);
+    dnsDelegationHandler.withDefaultLogStream(LogStream);
     console.log = function () {};
+    dnsDelegationHandler.waitForRecordSetChange = function () { 
+      return Promise.resolve({});
+    };
   });
   afterEach(() => {
-    AWS.restore();
+    r53Mock.reset();
     console.log = origLog;
   });
 
@@ -32,12 +40,21 @@ describe("DNS Delegation Handler", () => {
       .put("/", (body) => {
         return (
           body.Status === "FAILED" &&
-          body.Reason === "Unsupported request type undefined"
+          body.Reason ===
+            "Unsupported request type undefined (Log: /aws/lambda/testLambda/2021/06/28/[$LATEST]9b93a7dca7344adeb193d15c092dbbfd)"
         );
       })
       .reply(200);
     return LambdaTester(dnsDelegationHandler.domainDelegationHandler)
-      .event({})
+      .event({
+        RequestId: testRequestId,
+        ResourceProperties: {
+          DomainName: testDomainName,
+          SubdomainName: testSubDomainName,
+          NameServers: testNameServers,
+          RootDNSRole: testIAMRole,
+        },
+      })
       .expectResolve(() => {
         expect(request.isDone()).toBe(true);
       });
@@ -49,13 +66,23 @@ describe("DNS Delegation Handler", () => {
       .put("/", (body) => {
         return (
           body.Status === "FAILED" &&
-          body.Reason === "Unsupported request type " + bogusType
+          body.Reason ===
+            "Unsupported request type " +
+              bogusType +
+              " (Log: /aws/lambda/testLambda/2021/06/28/[$LATEST]9b93a7dca7344adeb193d15c092dbbfd)"
         );
       })
       .reply(200);
     return LambdaTester(dnsDelegationHandler.domainDelegationHandler)
       .event({
         RequestType: bogusType,
+        RequestId: testRequestId,
+        ResourceProperties: {
+          DomainName: testDomainName,
+          SubdomainName: testSubDomainName,
+          NameServers: testNameServers,
+          RootDNSRole: testIAMRole,
+        },
       })
       .expectResolve(() => {
         expect(request.isDone()).toBe(true);
@@ -79,15 +106,8 @@ describe("DNS Delegation Handler", () => {
       },
     });
 
-    const waitForFake = sinon.fake.resolves({});
-
-    AWS.mock("Route53", "listHostedZonesByName", listHostedZonesByNameFake);
-    AWS.mock(
-      "Route53",
-      "changeResourceRecordSets",
-      changeResourceRecordSetsFake
-    );
-    AWS.mock("Route53", "waitFor", waitForFake);
+    r53Mock.on(r53.ListHostedZonesByNameCommand).callsFake(listHostedZonesByNameFake);
+    r53Mock.on(r53.ChangeResourceRecordSetsCommand).callsFake(changeResourceRecordSetsFake);
     const request = nock(ResponseURL)
       .put("/", (body) => {
         return body.Status === "SUCCESS";
@@ -150,12 +170,8 @@ describe("DNS Delegation Handler", () => {
       },
     });
 
-    AWS.mock("Route53", "listHostedZonesByName", listHostedZonesByNameFake);
-    AWS.mock(
-      "Route53",
-      "changeResourceRecordSets",
-      changeResourceRecordSetsFake
-    );
+    r53Mock.on(r53.ListHostedZonesByNameCommand).callsFake(listHostedZonesByNameFake);
+    r53Mock.on(r53.ChangeResourceRecordSetsCommand).callsFake(changeResourceRecordSetsFake);
 
     const request = nock(ResponseURL)
       .put("/", (body) => {
@@ -217,16 +233,10 @@ describe("DNS Delegation Handler", () => {
       ],
     });
 
-    const waitForFake = sinon.fake.resolves({});
+    r53Mock.on(r53.ListHostedZonesByNameCommand).callsFake(listHostedZonesByNameFake);
+    r53Mock.on(r53.ListResourceRecordSetsCommand).callsFake(listResourceRecordSetsFake);
+    r53Mock.on(r53.ChangeResourceRecordSetsCommand).callsFake(changeResourceRecordSetsFake);
 
-    AWS.mock("Route53", "listHostedZonesByName", listHostedZonesByNameFake);
-    AWS.mock("Route53", "listResourceRecordSets", listResourceRecordSetsFake);
-    AWS.mock(
-      "Route53",
-      "changeResourceRecordSets",
-      changeResourceRecordSetsFake
-    );
-    AWS.mock("Route53", "waitFor", waitForFake);
     const request = nock(ResponseURL)
       .put("/", (body) => {
         return body.Status === "SUCCESS";
@@ -297,12 +307,8 @@ describe("DNS Delegation Handler", () => {
       },
     });
 
-    AWS.mock("Route53", "listHostedZonesByName", listHostedZonesByNameFake);
-    AWS.mock(
-      "Route53",
-      "changeResourceRecordSets",
-      changeResourceRecordSetsFake
-    );
+    r53Mock.on(r53.ListHostedZonesByNameCommand).callsFake(listHostedZonesByNameFake);
+    r53Mock.on(r53.ChangeResourceRecordSetsCommand).callsFake(changeResourceRecordSetsFake);
 
     const request = nock(ResponseURL)
       .put("/", (body) => {
@@ -363,16 +369,9 @@ describe("DNS Delegation Handler", () => {
       ],
     });
 
-    const waitForFake = sinon.fake.resolves({});
-
-    AWS.mock("Route53", "listHostedZonesByName", listHostedZonesByNameFake);
-    AWS.mock("Route53", "listResourceRecordSets", listResourceRecordSetsFake);
-    AWS.mock(
-      "Route53",
-      "changeResourceRecordSets",
-      changeResourceRecordSetsFake
-    );
-    AWS.mock("Route53", "waitFor", waitForFake);
+    r53Mock.on(r53.ListHostedZonesByNameCommand).callsFake(listHostedZonesByNameFake);
+    r53Mock.on(r53.ListResourceRecordSetsCommand).callsFake(listResourceRecordSetsFake);
+    r53Mock.on(r53.ChangeResourceRecordSetsCommand).callsFake(changeResourceRecordSetsFake);
     const request = nock(ResponseURL)
       .put("/", (body) => {
         return body.Status === "FAILED";
@@ -441,16 +440,9 @@ describe("DNS Delegation Handler", () => {
       ],
     });
 
-    const waitForFake = sinon.fake.resolves({});
-
-    AWS.mock("Route53", "listHostedZonesByName", listHostedZonesByNameFake);
-    AWS.mock("Route53", "listResourceRecordSets", listResourceRecordSetsFake);
-    AWS.mock(
-      "Route53",
-      "changeResourceRecordSets",
-      changeResourceRecordSetsFake
-    );
-    AWS.mock("Route53", "waitFor", waitForFake);
+    r53Mock.on(r53.ListHostedZonesByNameCommand).callsFake(listHostedZonesByNameFake);
+    r53Mock.on(r53.ListResourceRecordSetsCommand).callsFake(listResourceRecordSetsFake);
+    r53Mock.on(r53.ChangeResourceRecordSetsCommand).callsFake(changeResourceRecordSetsFake);
     const request = nock(ResponseURL)
       .put("/", (body) => {
         return body.Status === "FAILED";

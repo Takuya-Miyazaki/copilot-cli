@@ -13,9 +13,12 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/cloudformation"
-	"github.com/aws/copilot-cli/internal/pkg/addon"
+	"github.com/aws/copilot-cli/internal/pkg/config"
+	"github.com/aws/copilot-cli/internal/pkg/deploy/upload/customresource"
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
 	"github.com/aws/copilot-cli/internal/pkg/template"
+	"github.com/aws/copilot-cli/internal/pkg/template/override"
 	"github.com/robfig/cron/v3"
 )
 
@@ -24,24 +27,20 @@ const (
 	ScheduledJobScheduleParamKey = "Schedule"
 )
 
-type scheduledJobParser interface {
-	ParseScheduledJob(template.WorkloadOpts) (*template.Content, error)
-}
-
 // ScheduledJob represents the configuration needed to create a Cloudformation stack from a
 // scheduled job manfiest.
 type ScheduledJob struct {
-	*wkld
+	*ecsWkld
 	manifest *manifest.ScheduledJob
 
-	parser scheduledJobParser
+	parser scheduledJobReadParser
 }
 
 var (
 	fmtRateScheduleExpression = "rate(%d %s)" // rate({duration} {units})
 	fmtCronScheduleExpression = "cron(%s)"
 
-	awsScheduleRegexp = regexp.MustCompile(`(?:rate|cron)\(.*\)`) // Validates that an expression is of the form rate(xyz) or cron(abc)
+	awsScheduleRegexp = regexp.MustCompile(`((?:rate|cron)\(.*\)|none)`) // Validates that an expression is of the form rate(xyz) or cron(abc) or value 'none'
 )
 
 const (
@@ -87,74 +86,136 @@ func (e errDurationInvalid) Error() string {
 	return fmt.Sprintf("parse duration: %v", e.reason)
 }
 
-// NewScheduledJob creates a new ScheduledJob stack from a manifest file.
-func NewScheduledJob(mft *manifest.ScheduledJob, env, app string, rc RuntimeConfig) (*ScheduledJob, error) {
-	parser := template.New()
-	addons, err := addon.New(aws.StringValue(mft.Name))
-	if err != nil {
-		return nil, fmt.Errorf("new addons: %w", err)
-	}
-	envManifest, err := mft.ApplyEnv(env)
-	if err != nil {
-		return nil, fmt.Errorf("apply environment %s override: %w", env, err)
-	}
-	return &ScheduledJob{
-		wkld: &wkld{
-			name:   aws.StringValue(mft.Name),
-			env:    env,
-			app:    app,
-			tc:     envManifest.ScheduledJobConfig.TaskConfig,
-			rc:     rc,
-			image:  envManifest.ImageConfig,
-			parser: parser,
-			addons: addons,
-		},
-		manifest: envManifest,
+// ScheduledJobConfig contains data required to initialize a scheduled job stack.
+type ScheduledJobConfig struct {
+	App                *config.Application
+	Env                string
+	Manifest           *manifest.ScheduledJob
+	ArtifactBucketName string
+	ArtifactKey        string
+	RawManifest        string
+	RuntimeConfig      RuntimeConfig
+	Addons             NestedStackConfigurer
+}
 
-		parser: parser,
+// NewScheduledJob creates a new ScheduledJob stack from a manifest file.
+func NewScheduledJob(cfg ScheduledJobConfig) (*ScheduledJob, error) {
+	crs, err := customresource.ScheduledJob(fs)
+	if err != nil {
+		return nil, fmt.Errorf("scheduled job custom resources: %w", err)
+	}
+	cfg.RuntimeConfig.loadCustomResourceURLs(cfg.ArtifactBucketName, uploadableCRs(crs).convert())
+
+	return &ScheduledJob{
+		ecsWkld: &ecsWkld{
+			wkld: &wkld{
+				name:               aws.StringValue(cfg.Manifest.Name),
+				env:                cfg.Env,
+				app:                cfg.App.Name,
+				permBound:          cfg.App.PermissionsBoundary,
+				artifactBucketName: cfg.ArtifactBucketName,
+				artifactKey:        cfg.ArtifactKey,
+				rc:                 cfg.RuntimeConfig,
+				image:              cfg.Manifest.ImageConfig.Image,
+				rawManifest:        cfg.RawManifest,
+				parser:             fs,
+				addons:             cfg.Addons,
+			},
+			sidecars:            cfg.Manifest.Sidecars,
+			logging:             cfg.Manifest.Logging,
+			tc:                  cfg.Manifest.TaskConfig,
+			taskDefOverrideFunc: override.CloudFormationTemplate,
+		},
+		manifest: cfg.Manifest,
+
+		parser: fs,
 	}, nil
 }
 
 // Template returns the CloudFormation template for the scheduled job.
 func (j *ScheduledJob) Template() (string, error) {
-	outputs, err := j.addonsOutputs()
+	addonsParams, err := j.addonsParameters()
 	if err != nil {
 		return "", err
 	}
-
-	sidecars, err := j.manifest.Sidecar.Options()
+	addonsOutputs, err := j.addonsOutputs()
+	if err != nil {
+		return "", err
+	}
+	exposedPorts, err := j.manifest.ExposedPorts()
+	if err != nil {
+		return "", fmt.Errorf("parse exposed ports in service manifest %s: %w", j.name, err)
+	}
+	sidecars, err := convertSidecars(j.manifest.Sidecars, exposedPorts.PortsForContainer, j.rc)
 	if err != nil {
 		return "", fmt.Errorf("convert the sidecar configuration for job %s: %w", j.name, err)
 	}
-
+	publishers, err := convertPublish(j.manifest.Publish(), j.rc.AccountID, j.rc.Region, j.app, j.env, j.name)
+	if err != nil {
+		return "", fmt.Errorf(`convert "publish" field for job %s: %w`, j.name, err)
+	}
 	schedule, err := j.awsSchedule()
 	if err != nil {
 		return "", fmt.Errorf("convert schedule for job %s: %w", j.name, err)
 	}
-
 	stateMachine, err := j.stateMachineOpts()
 	if err != nil {
 		return "", fmt.Errorf("convert retry/timeout config for job %s: %w", j.name, err)
 	}
+	crs, err := convertCustomResources(j.rc.CustomResourcesURL)
+	if err != nil {
+		return "", err
+	}
+	entrypoint, err := convertEntryPoint(j.manifest.EntryPoint)
+	if err != nil {
+		return "", err
+	}
+	command, err := convertCommand(j.manifest.Command)
+	if err != nil {
+		return "", err
+	}
 
 	content, err := j.parser.ParseScheduledJob(template.WorkloadOpts{
-		Variables:          j.manifest.Variables,
-		Secrets:            j.manifest.Secrets,
-		NestedStack:        outputs,
-		Sidecars:           sidecars,
-		ScheduleExpression: schedule,
-		StateMachine:       stateMachine,
-		LogConfig:          j.manifest.LogConfigOpts(),
+		SerializedManifest:       string(j.rawManifest),
+		Variables:                convertEnvVars(j.manifest.Variables),
+		Secrets:                  convertSecrets(j.manifest.Secrets),
+		WorkloadType:             manifestinfo.ScheduledJobType,
+		NestedStack:              addonsOutputs,
+		AddonsExtraParams:        addonsParams,
+		Sidecars:                 sidecars,
+		ScheduleExpression:       schedule,
+		StateMachine:             stateMachine,
+		HealthCheck:              convertContainerHealthCheck(j.manifest.ImageConfig.HealthCheck),
+		LogConfig:                convertLogging(j.manifest.Logging),
+		DockerLabels:             j.manifest.ImageConfig.Image.DockerLabels,
+		Storage:                  convertStorageOpts(j.manifest.Name, j.manifest.Storage),
+		Network:                  convertNetworkConfig(j.manifest.Network),
+		EntryPoint:               entrypoint,
+		Command:                  command,
+		DependsOn:                convertDependsOn(j.manifest.ImageConfig.Image.DependsOn),
+		CredentialsParameter:     aws.StringValue(j.manifest.ImageConfig.Image.Credentials),
+		ServiceDiscoveryEndpoint: j.rc.ServiceDiscoveryEndpoint,
+		Publish:                  publishers,
+		Platform:                 convertPlatform(j.manifest.Platform),
+		EnvVersion:               j.rc.EnvVersion,
+		Version:                  j.rc.Version,
+
+		CustomResources:     crs,
+		PermissionsBoundary: j.permBound,
 	})
 	if err != nil {
 		return "", fmt.Errorf("parse scheduled job template: %w", err)
 	}
-	return content.String(), nil
+	overriddenTpl, err := j.taskDefOverrideFunc(convertTaskDefOverrideRules(j.manifest.TaskDefOverrides), content.Bytes())
+	if err != nil {
+		return "", fmt.Errorf("apply task definition overrides: %w", err)
+	}
+	return string(overriddenTpl), nil
 }
 
 // Parameters returns the list of CloudFormation parameters used by the template.
 func (j *ScheduledJob) Parameters() ([]*cloudformation.Parameter, error) {
-	wkldParams, err := j.wkld.Parameters()
+	wkldParams, err := j.ecsWkld.Parameters()
 	if err != nil {
 		return nil, err
 	}
@@ -170,10 +231,9 @@ func (j *ScheduledJob) Parameters() ([]*cloudformation.Parameter, error) {
 	}...), nil
 }
 
-// SerializedParameters returns the CloudFormation stack's parameters serialized
-// to a YAML document annotated with comments for readability.
+// SerializedParameters returns the CloudFormation stack's parameters serialized to a JSON document.
 func (j *ScheduledJob) SerializedParameters() (string, error) {
-	return j.wkld.templateConfiguration(j)
+	return serializeTemplateConfig(j.wkld.parser, j)
 }
 
 // awsSchedule converts the Schedule string to the format required by Cloudwatch Events
@@ -186,32 +246,35 @@ func (j *ScheduledJob) SerializedParameters() (string, error) {
 // Exception is made for strings of the form "rate( )" or "cron( )". These are accepted as-is and
 // validated server-side by CloudFormation.
 func (j *ScheduledJob) awsSchedule() (string, error) {
-	if j.manifest.On.Schedule == "" {
+	schedule := aws.StringValue(j.manifest.On.Schedule)
+	if schedule == "" {
 		return "", fmt.Errorf(`missing required field "schedule" in manifest for job %s`, j.name)
 	}
 	// If the schedule uses default CloudWatch Events syntax, pass it through for server-side validation.
-	if match := awsScheduleRegexp.FindStringSubmatch(j.manifest.On.Schedule); match != nil {
-		return j.manifest.On.Schedule, nil
+	if match := awsScheduleRegexp.FindStringSubmatch(schedule); match != nil {
+		return aws.StringValue(j.manifest.On.Schedule), nil
 	}
 	// Try parsing the string as a cron expression to validate it.
-	if _, err := cron.ParseStandard(j.manifest.On.Schedule); err != nil {
+	if _, err := cron.ParseStandard(schedule); err != nil {
 		return "", errScheduleInvalid{reason: err}
 	}
 	var scheduleExpression string
 	var err error
 	switch {
-	case strings.HasPrefix(j.manifest.On.Schedule, every):
-		scheduleExpression, err = toRate(j.manifest.On.Schedule[len(every):])
+	case strings.HasPrefix(schedule, every):
+		scheduleExpression, err = toRate(schedule[len(every):])
 		if err != nil {
 			return "", fmt.Errorf("parse fixed interval: %w", err)
 		}
-	case strings.HasPrefix(j.manifest.On.Schedule, "@"):
-		scheduleExpression, err = toFixedSchedule(j.manifest.On.Schedule)
+	case strings.HasPrefix(schedule, "@"):
+		scheduleExpression, err = toFixedSchedule(schedule)
 		if err != nil {
 			return "", fmt.Errorf("parse preset schedule: %w", err)
 		}
+	case schedule == "none":
+		scheduleExpression = schedule // Keep expression as "none" when the job is disabled.
 	default:
-		scheduleExpression, err = toAWSCron(j.manifest.On.Schedule)
+		scheduleExpression, err = toAWSCron(schedule)
 		if err != nil {
 			return "", fmt.Errorf("parse cron schedule: %w", err)
 		}
@@ -221,7 +284,8 @@ func (j *ScheduledJob) awsSchedule() (string, error) {
 
 // toRate converts a cron "@every" directive to a rate expression defined in minutes.
 // example input: @every 1h30m
-//        output: rate(90 minutes)
+//
+//	output: rate(90 minutes)
 func toRate(duration string) (string, error) {
 	d, err := time.ParseDuration(duration)
 	if err != nil {
@@ -246,9 +310,10 @@ func toRate(duration string) (string, error) {
 // toFixedSchedule converts cron predefined schedules into AWS-flavored cron expressions.
 // (https://godoc.org/github.com/robfig/cron#hdr-Predefined_schedules)
 // Example input: @daily
-//        output: cron(0 0 * * ? *)
-//         input: @annually
-//        output: cron(0 0 1 1 ? *)
+//
+//	output: cron(0 0 * * ? *)
+//	 input: @annually
+//	output: cron(0 0 1 1 ? *)
 func toFixedSchedule(schedule string) (string, error) {
 	switch {
 	case strings.HasPrefix(schedule, hourly):
@@ -281,7 +346,8 @@ func awsCronFieldSpecified(input string) bool {
 // BOTH DOM and DOW cannot be specified
 // DOW numbers run 1-7, not 0-6
 // Example input: 0 9 * * 1-5 (at 9 am, Monday-Friday)
-//              : cron(0 9 ? * 2-6 *) (adds required ? operator, increments DOW to 1-index, adds year)
+//
+//	: cron(0 9 ? * 2-6 *) (adds required ? operator, increments DOW to 1-index, adds year)
 func toAWSCron(schedule string) (string, error) {
 	const (
 		MIN = iota
@@ -340,8 +406,8 @@ func toAWSCron(schedule string) (string, error) {
 // It also performs basic validations to provide a fast feedback loop to the customer.
 func (j *ScheduledJob) stateMachineOpts() (*template.StateMachineOpts, error) {
 	var timeoutSeconds *int
-	if j.manifest.Timeout != "" {
-		parsedTimeout, err := time.ParseDuration(j.manifest.Timeout)
+	if inTimeout := aws.StringValue(j.manifest.Timeout); inTimeout != "" {
+		parsedTimeout, err := time.ParseDuration(inTimeout)
 		if err != nil {
 			return nil, errDurationInvalid{reason: err}
 		}
@@ -355,11 +421,11 @@ func (j *ScheduledJob) stateMachineOpts() (*template.StateMachineOpts, error) {
 	}
 
 	var retries *int
-	if j.manifest.Retries != 0 {
-		if j.manifest.Retries < 0 {
+	if inRetries := aws.IntValue(j.manifest.Retries); inRetries != 0 {
+		if inRetries < 0 {
 			return nil, errors.New("number of retries cannot be negative")
 		}
-		retries = aws.Int(j.manifest.Retries)
+		retries = aws.Int(inRetries)
 	}
 	return &template.StateMachineOpts{
 		Timeout: timeoutSeconds,

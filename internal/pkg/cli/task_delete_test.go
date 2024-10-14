@@ -5,12 +5,14 @@ package cli
 
 import (
 	"errors"
+	"github.com/aws/copilot-cli/internal/pkg/term/prompt"
 	"testing"
+
+	"github.com/aws/aws-sdk-go/aws"
 
 	"github.com/aws/aws-sdk-go/aws/session"
 
 	awscfn "github.com/aws/copilot-cli/internal/pkg/aws/cloudformation"
-	"github.com/aws/copilot-cli/internal/pkg/aws/sessions"
 	"github.com/aws/copilot-cli/internal/pkg/cli/mocks"
 	"github.com/aws/copilot-cli/internal/pkg/config"
 	"github.com/aws/copilot-cli/internal/pkg/deploy"
@@ -19,8 +21,9 @@ import (
 )
 
 type validateMocks struct {
-	store *mocks.Mockstore
-	cfn   *mocks.MocktaskStackManager
+	store    *mocks.Mockstore
+	cfn      *mocks.MocktaskStackManager
+	provider *mocks.MocksessionProvider
 }
 
 func TestDeleteTaskOpts_Validate(t *testing.T) {
@@ -57,11 +60,12 @@ func TestDeleteTaskOpts_Validate(t *testing.T) {
 		"with all flags": {
 			inAppName: "phonetool",
 			inEnvName: "test",
-			inName: "oneoff",
+			inName:    "oneoff",
 			setupMocks: func(m validateMocks) {
 				m.store.EXPECT().GetApplication("phonetool").Return(&config.Application{Name: "phonetool"}, nil)
 				m.store.EXPECT().GetEnvironment("phonetool", "test").Return(&config.Environment{Name: "test", App: "phonetool"}, nil)
 				m.store.EXPECT().GetEnvironment("phonetool", "test").Return(&config.Environment{Name: "test", App: "phonetool"}, nil)
+				m.provider.EXPECT().FromRole(gomock.Any(), gomock.Any()).Return(&session.Session{}, nil)
 				m.cfn.EXPECT().GetTaskStack("oneoff")
 			},
 			want: nil,
@@ -69,22 +73,24 @@ func TestDeleteTaskOpts_Validate(t *testing.T) {
 		"task does not exist": {
 			inAppName: "phonetool",
 			inEnvName: "test",
-			inName: "oneoff",
-			want: errors.New("get task: some error"),
+			inName:    "oneoff",
+			want:      errors.New("get task: some error"),
 			setupMocks: func(m validateMocks) {
 				m.store.EXPECT().GetApplication("phonetool").Return(&config.Application{Name: "phonetool"}, nil)
 				m.store.EXPECT().GetEnvironment("phonetool", "test").Return(&config.Environment{Name: "test", App: "phonetool"}, nil)
 				m.store.EXPECT().GetEnvironment("phonetool", "test").Return(&config.Environment{Name: "test", App: "phonetool"}, nil)
+				m.provider.EXPECT().FromRole(gomock.Any(), gomock.Any()).Return(&session.Session{}, nil)
 				m.cfn.EXPECT().GetTaskStack("oneoff").Return(nil, errors.New("some error"))
 			},
 		},
 		"with default cluster flag set": {
 			inDefaultCluster: true,
 			inName:           "oneoff",
-			setupMocks:       func(m validateMocks) {
+			setupMocks: func(m validateMocks) {
+				m.provider.EXPECT().Default().Return(&session.Session{}, nil)
 				m.cfn.EXPECT().GetTaskStack("oneoff")
 			},
-			want:             nil,
+			want: nil,
 		},
 		"with default cluster and env flag": {
 			inDefaultCluster: true,
@@ -111,8 +117,9 @@ func TestDeleteTaskOpts_Validate(t *testing.T) {
 			mocktaskStackManager := mocks.NewMocktaskStackManager(ctrl)
 
 			mocks := validateMocks{
-				store: mockstore,
-				cfn: mocktaskStackManager,
+				store:    mockstore,
+				cfn:      mocktaskStackManager,
+				provider: mocks.NewMocksessionProvider(ctrl),
 			}
 
 			tc.setupMocks(mocks)
@@ -129,7 +136,7 @@ func TestDeleteTaskOpts_Validate(t *testing.T) {
 				newStackManager: func(_ *session.Session) taskStackManager {
 					return mocktaskStackManager
 				},
-				sess: sessions.NewProvider(),
+				provider: mocks.provider,
 			}
 
 			// WHEN
@@ -190,7 +197,7 @@ func TestDeleteTaskOpts_Ask(t *testing.T) {
 				m.EXPECT().FromRole(gomock.Any(), gomock.Any()).Return(&session.Session{}, nil)
 			},
 			mockPrompter: func(m *mocks.Mockprompter) {
-				m.EXPECT().Confirm("Are you sure you want to delete abc from application phonetool and environment test?", gomock.Any()).Return(true, nil)
+				m.EXPECT().Confirm("Are you sure you want to delete abc from application phonetool and environment test?", gomock.Any(), gomock.Any()).Return(true, nil)
 			},
 		},
 		"name flag not specified and confirm cancelled": {
@@ -209,7 +216,7 @@ func TestDeleteTaskOpts_Ask(t *testing.T) {
 				m.EXPECT().FromRole(gomock.Any(), gomock.Any()).Return(&session.Session{}, nil)
 			},
 			mockPrompter: func(m *mocks.Mockprompter) {
-				m.EXPECT().Confirm("Are you sure you want to delete abc from application phonetool and environment test?", gomock.Any()).Return(false, nil)
+				m.EXPECT().Confirm("Are you sure you want to delete abc from application phonetool and environment test?", gomock.Any(), gomock.Any()).Return(false, nil)
 			},
 			wantErr: "task delete cancelled - no changes made",
 		},
@@ -226,7 +233,7 @@ func TestDeleteTaskOpts_Ask(t *testing.T) {
 				m.EXPECT().Default().Return(&session.Session{}, nil)
 			},
 			mockPrompter: func(m *mocks.Mockprompter) {
-				m.EXPECT().Confirm("Are you sure you want to delete abc from the default cluster?", gomock.Any()).Return(true, nil)
+				m.EXPECT().Confirm("Are you sure you want to delete abc from the default cluster?", gomock.Any(), gomock.Any()).Return(true, nil)
 			},
 		},
 		"no flags specified": {
@@ -236,7 +243,7 @@ func TestDeleteTaskOpts_Ask(t *testing.T) {
 			},
 			mockSel: func(m *mocks.MockwsSelector) {
 				m.EXPECT().Application(taskDeleteAppPrompt, "", appEnvOptionNone).Return("phonetool", nil)
-				m.EXPECT().Environment(taskDeleteEnvPrompt, "", "phonetool", appEnvOptionNone).Return("test", nil)
+				m.EXPECT().Environment(taskDeleteEnvPrompt, "", "phonetool", prompt.Option{Value: appEnvOptionNone}).Return("test", nil)
 			},
 			mockTaskSelect: func(m *mocks.MockcfTaskSelector) {
 				m.EXPECT().Task(taskDeleteNamePrompt, "", gomock.Any()).Return("abc", nil)
@@ -245,7 +252,7 @@ func TestDeleteTaskOpts_Ask(t *testing.T) {
 				m.EXPECT().FromRole(gomock.Any(), gomock.Any()).Return(&session.Session{}, nil)
 			},
 			mockPrompter: func(m *mocks.Mockprompter) {
-				m.EXPECT().Confirm("Are you sure you want to delete abc from application phonetool and environment test?", gomock.Any()).Return(true, nil)
+				m.EXPECT().Confirm("Are you sure you want to delete abc from application phonetool and environment test?", gomock.Any(), gomock.Any()).Return(true, nil)
 			},
 		},
 		"no flags specified (default path)": {
@@ -260,7 +267,7 @@ func TestDeleteTaskOpts_Ask(t *testing.T) {
 				m.EXPECT().Default().Return(&session.Session{}, nil)
 			},
 			mockPrompter: func(m *mocks.Mockprompter) {
-				m.EXPECT().Confirm("Are you sure you want to delete abc from the default cluster?", gomock.Any()).Return(true, nil)
+				m.EXPECT().Confirm("Are you sure you want to delete abc from the default cluster?", gomock.Any(), gomock.Any()).Return(true, nil)
 			},
 		},
 	}
@@ -292,10 +299,10 @@ func TestDeleteTaskOpts_Ask(t *testing.T) {
 					name:             tc.inName,
 				},
 
-				store:  mockStore,
-				sel:    mockSel,
-				sess:   mockSess,
-				prompt: mockPrompt,
+				store:    mockStore,
+				sel:      mockSel,
+				provider: mockSess,
+				prompt:   mockPrompt,
 
 				newTaskSel: func(sess *session.Session) cfTaskSelector { return mockTaskSel },
 			}
@@ -315,8 +322,9 @@ func TestDeleteTaskOpts_Ask(t *testing.T) {
 
 type deleteTaskMocks struct {
 	store   *mocks.Mockstore
-	sess    *sessions.Provider
+	sess    *mocks.MocksessionProvider
 	ecr     *mocks.MockimageRemover
+	s3      *mocks.MockbucketEmptier
 	ecs     *mocks.MocktaskStopper
 	cfn     *mocks.MocktaskStackManager
 	spinner *mocks.Mockprogress
@@ -341,9 +349,14 @@ func TestDeleteTaskOpts_Execute(t *testing.T) {
 		Env:     mockEnvName,
 		RoleARN: mockManagerARN,
 
-		StackName: mockTaskStackName,
+		StackName:  mockTaskStackName,
+		BucketName: "arn:aws:s3:::bucket",
 	}
 	mockDefaultTask := deploy.TaskStackInfo{
+		StackName:  mockTaskStackName,
+		BucketName: "arn:aws:s3:::bucket",
+	}
+	mockDefaultTaskNoBucket := deploy.TaskStackInfo{
 		StackName: mockTaskStackName,
 	}
 	mockError := errors.New("some error")
@@ -364,6 +377,12 @@ func TestDeleteTaskOpts_Execute(t *testing.T) {
 			inName: mockTaskName,
 
 			setupMocks: func(m deleteTaskMocks) {
+				m.sess.EXPECT().FromRole(mockEnv.ManagerRoleARN, mockEnv.Region).Return(&session.Session{
+					Config: &aws.Config{
+						Region: aws.String("mockRegion"),
+					},
+				}, nil)
+				m.sess.EXPECT().DefaultWithRegion("mockRegion").Return(&session.Session{}, nil)
 				gomock.InOrder(
 					m.store.EXPECT().GetEnvironment(mockApp, mockEnvName).Return(mockEnv, nil),
 					m.spinner.EXPECT().Start(gomock.Any()),
@@ -373,6 +392,9 @@ func TestDeleteTaskOpts_Execute(t *testing.T) {
 					m.ecr.EXPECT().ClearRepository(mockTaskRepoName).Return(nil),
 					m.spinner.EXPECT().Stop(gomock.Any()),
 					m.cfn.EXPECT().GetTaskStack(mockTaskName).Return(mockAppEnvTask, nil),
+					m.spinner.EXPECT().Start(gomock.Any()),
+					m.s3.EXPECT().EmptyBucket(gomock.Any()).Return(nil),
+					m.spinner.EXPECT().Stop(gomock.Any()),
 					m.spinner.EXPECT().Start(gomock.Any()),
 					m.cfn.EXPECT().DeleteTask(*mockAppEnvTask).Return(nil),
 					m.spinner.EXPECT().Stop(gomock.Any()),
@@ -385,6 +407,7 @@ func TestDeleteTaskOpts_Execute(t *testing.T) {
 
 			setupMocks: func(m deleteTaskMocks) {
 				gomock.InOrder(
+					m.sess.EXPECT().Default().Return(&session.Session{}, nil),
 					m.spinner.EXPECT().Start(gomock.Any()),
 					m.ecs.EXPECT().StopDefaultClusterTasks(mockTaskName).Return(nil),
 					m.spinner.EXPECT().Stop(gomock.Any()),
@@ -393,7 +416,30 @@ func TestDeleteTaskOpts_Execute(t *testing.T) {
 					m.spinner.EXPECT().Stop(gomock.Any()),
 					m.cfn.EXPECT().GetTaskStack(mockTaskName).Return(&mockDefaultTask, nil),
 					m.spinner.EXPECT().Start(gomock.Any()),
+					m.s3.EXPECT().EmptyBucket(gomock.Any()).Return(nil),
+					m.spinner.EXPECT().Stop(gomock.Any()),
+					m.spinner.EXPECT().Start(gomock.Any()),
 					m.cfn.EXPECT().DeleteTask(mockDefaultTask).Return(nil),
+					m.spinner.EXPECT().Stop(gomock.Any()),
+				)
+			},
+		},
+		"success with default cluster and no S3 bucket": {
+			inDefault: true,
+			inName:    mockTaskName,
+
+			setupMocks: func(m deleteTaskMocks) {
+				gomock.InOrder(
+					m.sess.EXPECT().Default().Return(&session.Session{}, nil),
+					m.spinner.EXPECT().Start(gomock.Any()),
+					m.ecs.EXPECT().StopDefaultClusterTasks(mockTaskName).Return(nil),
+					m.spinner.EXPECT().Stop(gomock.Any()),
+					m.spinner.EXPECT().Start(gomock.Any()),
+					m.ecr.EXPECT().ClearRepository(mockTaskRepoName).Return(nil),
+					m.spinner.EXPECT().Stop(gomock.Any()),
+					m.cfn.EXPECT().GetTaskStack(mockTaskName).Return(&mockDefaultTaskNoBucket, nil),
+					m.spinner.EXPECT().Start(gomock.Any()),
+					m.cfn.EXPECT().DeleteTask(mockDefaultTaskNoBucket).Return(nil),
 					m.spinner.EXPECT().Stop(gomock.Any()),
 				)
 			},
@@ -419,6 +465,12 @@ func TestDeleteTaskOpts_Execute(t *testing.T) {
 			wantedErr: errors.New("delete stack for task hide-snacks: some error"),
 
 			setupMocks: func(m deleteTaskMocks) {
+				m.sess.EXPECT().FromRole(mockEnv.ManagerRoleARN, mockEnv.Region).Return(&session.Session{
+					Config: &aws.Config{
+						Region: aws.String("mockRegion"),
+					},
+				}, nil)
+				m.sess.EXPECT().DefaultWithRegion("mockRegion").Return(&session.Session{}, nil)
 				gomock.InOrder(
 					m.store.EXPECT().GetEnvironment(mockApp, mockEnvName).Return(mockEnv, nil),
 					m.spinner.EXPECT().Start(gomock.Any()),
@@ -428,6 +480,9 @@ func TestDeleteTaskOpts_Execute(t *testing.T) {
 					m.ecr.EXPECT().ClearRepository(mockTaskRepoName).Return(nil),
 					m.spinner.EXPECT().Stop(gomock.Any()),
 					m.cfn.EXPECT().GetTaskStack(mockTaskName).Return(mockAppEnvTask, nil),
+					m.spinner.EXPECT().Start(gomock.Any()),
+					m.s3.EXPECT().EmptyBucket(gomock.Any()).Return(nil),
+					m.spinner.EXPECT().Stop(gomock.Any()),
 					m.spinner.EXPECT().Start(gomock.Any()),
 					m.cfn.EXPECT().DeleteTask(*mockAppEnvTask).Return(mockError),
 					m.spinner.EXPECT().Stop(gomock.Any()),
@@ -441,6 +496,12 @@ func TestDeleteTaskOpts_Execute(t *testing.T) {
 
 			setupMocks: func(m deleteTaskMocks) {
 				mockErrStackNotFound := awscfn.ErrStackNotFound{}
+				m.sess.EXPECT().FromRole(mockEnv.ManagerRoleARN, mockEnv.Region).Return(&session.Session{
+					Config: &aws.Config{
+						Region: aws.String("mockRegion"),
+					},
+				}, nil)
+				m.sess.EXPECT().DefaultWithRegion("mockRegion").Return(&session.Session{}, nil)
 				gomock.InOrder(
 					m.store.EXPECT().GetEnvironment(mockApp, mockEnvName).Return(mockEnv, nil),
 					m.spinner.EXPECT().Start(gomock.Any()),
@@ -458,9 +519,15 @@ func TestDeleteTaskOpts_Execute(t *testing.T) {
 			inEnv:  mockEnvName,
 			inName: mockTaskName,
 
-			wantedErr: errors.New("clear ECR repository for task hide-snacks: some error"),
+			wantedErr: errors.New("empty ECR repository for task hide-snacks: some error"),
 
 			setupMocks: func(m deleteTaskMocks) {
+				m.sess.EXPECT().FromRole(mockEnv.ManagerRoleARN, mockEnv.Region).Return(&session.Session{
+					Config: &aws.Config{
+						Region: aws.String("mockRegion"),
+					},
+				}, nil)
+				m.sess.EXPECT().DefaultWithRegion("mockRegion").Return(&session.Session{}, nil)
 				gomock.InOrder(
 					m.store.EXPECT().GetEnvironment(mockApp, mockEnvName).Return(mockEnv, nil),
 					m.spinner.EXPECT().Start(gomock.Any()),
@@ -468,6 +535,35 @@ func TestDeleteTaskOpts_Execute(t *testing.T) {
 					m.spinner.EXPECT().Stop(gomock.Any()),
 					m.spinner.EXPECT().Start(gomock.Any()),
 					m.ecr.EXPECT().ClearRepository(mockTaskRepoName).Return(mockError),
+					m.spinner.EXPECT().Stop(gomock.Any()),
+				)
+			},
+		},
+		"error clearing s3 bucket": {
+			inApp:  mockApp,
+			inEnv:  mockEnvName,
+			inName: mockTaskName,
+
+			wantedErr: errors.New("empty S3 bucket for task hide-snacks: some error"),
+
+			setupMocks: func(m deleteTaskMocks) {
+				m.sess.EXPECT().FromRole(mockEnv.ManagerRoleARN, mockEnv.Region).Return(&session.Session{
+					Config: &aws.Config{
+						Region: aws.String("mockRegion"),
+					},
+				}, nil)
+				m.sess.EXPECT().DefaultWithRegion("mockRegion").Return(&session.Session{}, nil)
+				gomock.InOrder(
+					m.store.EXPECT().GetEnvironment(mockApp, mockEnvName).Return(mockEnv, nil),
+					m.spinner.EXPECT().Start(gomock.Any()),
+					m.ecs.EXPECT().StopOneOffTasks(mockApp, mockEnvName, mockTaskName).Return(nil),
+					m.spinner.EXPECT().Stop(gomock.Any()),
+					m.spinner.EXPECT().Start(gomock.Any()),
+					m.ecr.EXPECT().ClearRepository(mockTaskRepoName).Return(nil),
+					m.spinner.EXPECT().Stop(gomock.Any()),
+					m.cfn.EXPECT().GetTaskStack(mockTaskName).Return(mockAppEnvTask, nil),
+					m.spinner.EXPECT().Start(gomock.Any()),
+					m.s3.EXPECT().EmptyBucket(gomock.Any()).Return(mockError),
 					m.spinner.EXPECT().Stop(gomock.Any()),
 				)
 			},
@@ -480,6 +576,11 @@ func TestDeleteTaskOpts_Execute(t *testing.T) {
 			wantedErr: errors.New("stop running tasks in family hide-snacks: some error"),
 
 			setupMocks: func(m deleteTaskMocks) {
+				m.sess.EXPECT().FromRole(mockEnv.ManagerRoleARN, mockEnv.Region).Return(&session.Session{
+					Config: &aws.Config{
+						Region: aws.String("mockRegion"),
+					},
+				}, nil)
 				gomock.InOrder(
 					m.store.EXPECT().GetEnvironment(mockApp, mockEnvName).Return(mockEnv, nil),
 					m.spinner.EXPECT().Start(gomock.Any()),
@@ -496,6 +597,12 @@ func TestDeleteTaskOpts_Execute(t *testing.T) {
 			wantedErr: errors.New("some error"),
 
 			setupMocks: func(m deleteTaskMocks) {
+				m.sess.EXPECT().FromRole(mockEnv.ManagerRoleARN, mockEnv.Region).Return(&session.Session{
+					Config: &aws.Config{
+						Region: aws.String("mockRegion"),
+					},
+				}, nil)
+				m.sess.EXPECT().DefaultWithRegion("mockRegion").Return(&session.Session{}, nil)
 				gomock.InOrder(
 					m.store.EXPECT().GetEnvironment(mockApp, mockEnvName).Return(mockEnv, nil),
 					m.spinner.EXPECT().Start(gomock.Any()),
@@ -515,6 +622,7 @@ func TestDeleteTaskOpts_Execute(t *testing.T) {
 			wantedErr: errors.New("stop running tasks in family hide-snacks: some error"),
 
 			setupMocks: func(m deleteTaskMocks) {
+				m.sess.EXPECT().Default().Return(&session.Session{}, nil)
 				gomock.InOrder(
 					m.spinner.EXPECT().Start(gomock.Any()),
 					m.ecs.EXPECT().StopDefaultClusterTasks(mockTaskName).Return(mockError),
@@ -532,13 +640,18 @@ func TestDeleteTaskOpts_Execute(t *testing.T) {
 			// GIVEN
 			mockstore := mocks.NewMockstore(ctrl)
 			mockECR := mocks.NewMockimageRemover(ctrl)
+			mockS3 := mocks.NewMockbucketEmptier(ctrl)
 			mockCFN := mocks.NewMocktaskStackManager(ctrl)
 			mockECS := mocks.NewMocktaskStopper(ctrl)
-			mockSession := sessions.NewProvider()
+			//mockSession := sessions.NewProvider()
+			mockSession := mocks.NewMocksessionProvider(ctrl)
 			mockSpinner := mocks.NewMockprogress(ctrl)
 
 			mockGetECR := func(_ *session.Session) imageRemover {
 				return mockECR
+			}
+			mockGetS3 := func(_ *session.Session) bucketEmptier {
+				return mockS3
 			}
 			mockGetECS := func(_ *session.Session) taskStopper {
 				return mockECS
@@ -551,6 +664,7 @@ func TestDeleteTaskOpts_Execute(t *testing.T) {
 				store:   mockstore,
 				sess:    mockSession,
 				ecr:     mockECR,
+				s3:      mockS3,
 				ecs:     mockECS,
 				cfn:     mockCFN,
 				spinner: mockSpinner,
@@ -565,13 +679,14 @@ func TestDeleteTaskOpts_Execute(t *testing.T) {
 					name:           tc.inName,
 					defaultCluster: tc.inDefault,
 				},
-				store:   mockstore,
-				sess:    mockSession,
-				spinner: mockSpinner,
+				store:    mockstore,
+				provider: mockSession,
+				spinner:  mockSpinner,
 
-				newImageRemover: mockGetECR,
-				newStackManager: mockGetCFN,
-				newTaskStopper:  mockGetECS,
+				newImageRemover:  mockGetECR,
+				newBucketEmptier: mockGetS3,
+				newStackManager:  mockGetCFN,
+				newTaskStopper:   mockGetECS,
 			}
 
 			// WHEN

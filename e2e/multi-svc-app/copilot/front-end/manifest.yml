@@ -13,7 +13,7 @@ image:
     dockerfile: front-end/Dockerfile
     context: front-end
     args:
-      MAGIC_WORDS_ARG: "open sesame"
+      MAGIC_VERB_ARG: "open"
   # Port exposed through your container to route traffic to it.
   port: 80
 
@@ -21,6 +21,14 @@ http:
   # Requests to this path will be forwarded to your service. 
   # To match all requests you can use the "/" path. 
   path: '/'
+
+nlb:
+  port: 8080/udp
+  healthcheck:
+    port: 80
+
+network:
+  connect: true
 
 # Number of CPU units for the task.
 cpu: 256
@@ -32,7 +40,18 @@ count:
   cpu_percentage: 70
   memory_percentage: 80
 
+storage:
+  ephemeral: 30
+  volumes:
+    efsTestVolume:
+      path: /var/www
+      read_only: false
+      efs: true
+      
+
 variables:
   TEST_JSON_ENV_VAR: "{}" # https://github.com/aws/copilot-cli/issues/1292
   TEST_BOOL_ENV_VAR: on # https://github.com/aws/copilot-cli/issues/1120
   TEST_JOB_CHECK_VAR: "no"
+
+env_file: magic.env

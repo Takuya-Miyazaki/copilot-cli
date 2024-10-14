@@ -5,18 +5,23 @@
 package secretsmanager
 
 import (
+	"context"
 	"fmt"
 	"time"
+
+	"github.com/aws/aws-sdk-go/aws/request"
+	"github.com/aws/aws-sdk-go/aws/session"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/secretsmanager"
-	"github.com/aws/copilot-cli/internal/pkg/aws/sessions"
 )
 
 type api interface {
 	CreateSecret(*secretsmanager.CreateSecretInput) (*secretsmanager.CreateSecretOutput, error)
 	DeleteSecret(*secretsmanager.DeleteSecretInput) (*secretsmanager.DeleteSecretOutput, error)
+	DescribeSecret(*secretsmanager.DescribeSecretInput) (*secretsmanager.DescribeSecretOutput, error)
+	GetSecretValueWithContext(context.Context, *secretsmanager.GetSecretValueInput, ...request.Option) (*secretsmanager.GetSecretValueOutput, error)
 }
 
 // SecretsManager wraps the AWS SecretManager client.
@@ -25,19 +30,12 @@ type SecretsManager struct {
 	sessionRegion  string
 }
 
-// New returns a SecretsManager configured with the default session.
-func New() (*SecretsManager, error) {
-	p := sessions.NewProvider()
-	sess, err := p.Default()
-
-	if err != nil {
-		return nil, err
-	}
-
+// New returns a SecretsManager configured against the input session.
+func New(s *session.Session) *SecretsManager {
 	return &SecretsManager{
-		secretsManager: secretsmanager.New(sess),
-		sessionRegion:  *sess.Config.Region,
-	}, nil
+		secretsManager: secretsmanager.New(s),
+		sessionRegion:  *s.Config.Region,
+	}
 }
 
 var secretTags = func() []*secretsmanager.Tag {
@@ -83,9 +81,52 @@ func (s *SecretsManager) DeleteSecret(secretName string) error {
 	})
 
 	if err != nil {
-		return fmt.Errorf("delete secret %s from secrets manager: %+v", secretName, err)
+		return fmt.Errorf("delete secret %s from secrets manager: %w", secretName, err)
 	}
 	return nil
+}
+
+// DescribeSecretOutput is the output returned by DescribeSecret.
+type DescribeSecretOutput struct {
+	Name        *string
+	CreatedDate *time.Time
+	Tags        []*secretsmanager.Tag
+}
+
+// DescribeSecret retrieves the details of a secret.
+func (s *SecretsManager) DescribeSecret(secretName string) (*DescribeSecretOutput, error) {
+	resp, err := s.secretsManager.DescribeSecret(&secretsmanager.DescribeSecretInput{
+		SecretId: aws.String(secretName),
+	})
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok {
+			if aerr.Code() == secretsmanager.ErrCodeResourceNotFoundException {
+				return nil, &ErrSecretNotFound{
+					secretName: secretName,
+					parentErr:  err,
+				}
+			}
+		}
+		return nil, fmt.Errorf("describe secret %s: %w", secretName, err)
+	}
+
+	return &DescribeSecretOutput{
+		Name:        resp.Name,
+		CreatedDate: resp.CreatedDate,
+		Tags:        resp.Tags,
+	}, nil
+}
+
+// GetSecretValue retrieves the value of a secret from AWS Secrets Manager.
+// It takes the name of the secret as input and returns the corresponding value as a string.
+func (s *SecretsManager) GetSecretValue(ctx context.Context, name string) (string, error) {
+	resp, err := s.secretsManager.GetSecretValueWithContext(ctx, &secretsmanager.GetSecretValueInput{
+		SecretId: aws.String(name),
+	})
+	if err != nil {
+		return "", fmt.Errorf("get secret %q from secrets manager: %w", name, err)
+	}
+	return aws.StringValue(resp.SecretString), nil
 }
 
 // ErrSecretAlreadyExists occurs if a secret with the same name already exists.
@@ -96,4 +137,14 @@ type ErrSecretAlreadyExists struct {
 
 func (err *ErrSecretAlreadyExists) Error() string {
 	return fmt.Sprintf("secret %s already exists", err.secretName)
+}
+
+// ErrSecretNotFound occurs if a secret with the given name does not exist.
+type ErrSecretNotFound struct {
+	secretName string
+	parentErr  error
+}
+
+func (err *ErrSecretNotFound) Error() string {
+	return fmt.Sprintf("secret %s was not found: %s", err.secretName, err.parentErr)
 }

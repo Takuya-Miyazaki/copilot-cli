@@ -14,40 +14,14 @@ import (
 )
 
 const (
-	defaultForAZFilterName = "default-for-az"
+	defaultForAZFilterName   = "default-for-az"
+	internetGatewayIDPrefix  = "igw-"
+	cloudFrontPrefixListName = "com.amazonaws.global.cloudfront.origin-facing"
 
-	// TagFilterName is the filter name format for tag filters
-	TagFilterName = "tag:%s"
+	// FmtTagFilter is the filter name format for tag filters
+	FmtTagFilter = "tag:%s"
+	tagKeyFilter = "tag-key"
 )
-
-// ListVPCSubnetsOpts sets up optional parameters for ListVPCSubnets function.
-type ListVPCSubnetsOpts func([]*ec2.Subnet) []*ec2.Subnet
-
-// FilterForPublicSubnets is used to filter to get public subnets.
-func FilterForPublicSubnets() ListVPCSubnetsOpts {
-	return func(subnets []*ec2.Subnet) []*ec2.Subnet {
-		var publicSubnets []*ec2.Subnet
-		for _, subnet := range subnets {
-			if aws.BoolValue(subnet.MapPublicIpOnLaunch) {
-				publicSubnets = append(publicSubnets, subnet)
-			}
-		}
-		return publicSubnets
-	}
-}
-
-// FilterForPrivateSubnets is used to filter to get private subnets.
-func FilterForPrivateSubnets() ListVPCSubnetsOpts {
-	return func(subnets []*ec2.Subnet) []*ec2.Subnet {
-		var privateSubnets []*ec2.Subnet
-		for _, subnet := range subnets {
-			if !aws.BoolValue(subnet.MapPublicIpOnLaunch) {
-				privateSubnets = append(privateSubnets, subnet)
-			}
-		}
-		return privateSubnets
-	}
-}
 
 var (
 	// FilterForDefaultVPCSubnets is a pre-defined filter for the default subnets at the availability zone.
@@ -62,6 +36,10 @@ type api interface {
 	DescribeSecurityGroups(*ec2.DescribeSecurityGroupsInput) (*ec2.DescribeSecurityGroupsOutput, error)
 	DescribeVpcs(input *ec2.DescribeVpcsInput) (*ec2.DescribeVpcsOutput, error)
 	DescribeVpcAttribute(input *ec2.DescribeVpcAttributeInput) (*ec2.DescribeVpcAttributeOutput, error)
+	DescribeNetworkInterfaces(input *ec2.DescribeNetworkInterfacesInput) (*ec2.DescribeNetworkInterfacesOutput, error)
+	DescribeRouteTables(input *ec2.DescribeRouteTablesInput) (*ec2.DescribeRouteTablesOutput, error)
+	DescribeAvailabilityZones(input *ec2.DescribeAvailabilityZonesInput) (*ec2.DescribeAvailabilityZonesOutput, error)
+	DescribeManagedPrefixLists(input *ec2.DescribeManagedPrefixListsInput) (*ec2.DescribeManagedPrefixListsOutput, error)
 }
 
 // Filter contains the name and values of a filter.
@@ -71,6 +49,17 @@ type Filter struct {
 	Name string
 	// Value of the filter.
 	Values []string
+}
+
+// FilterForTags takes a key and optional values to construct an EC2 filter.
+func FilterForTags(key string, values ...string) Filter {
+	if len(values) == 0 {
+		return Filter{Name: tagKeyFilter, Values: []string{key}}
+	}
+	return Filter{
+		Name:   fmt.Sprintf(FmtTagFilter, key),
+		Values: values,
+	}
 }
 
 // EC2 wraps an AWS EC2 client.
@@ -85,39 +74,95 @@ func New(s *session.Session) *EC2 {
 	}
 }
 
-// VPC contains the ID and name of a VPC.
-type VPC struct {
+// Resource contains the ID and name of a EC2 resource.
+type Resource struct {
 	ID   string
 	Name string
 }
 
-// String formats the elements of a VPC into a display-ready string.
-// For example: VPC{ID: "vpc-0576efeea396efee2", Name: "copilot-video-store-test"}
-// will return vpc-0576efeea396efee2 (copilot-video-store-test).
-func (v *VPC) String() string {
-	if v.Name != "" {
-		return fmt.Sprintf("%s (%s)", v.ID, v.Name)
-	}
-	return v.ID
+// VPC contains the ID and name of a VPC.
+type VPC struct {
+	Resource
 }
 
-// ExtractVPC extracts the VPC ID from the VPC display string.
+// Subnet contains the ID and name of a subnet.
+type Subnet struct {
+	Resource
+	CIDRBlock string
+}
+
+// AZ represents an availability zone.
+type AZ Resource
+
+// String formats the elements of a VPC into a display-ready string.
+// For example: VPCResource{"ID": "vpc-0576efeea396efee2", "Name": "video-store-test"}
+// will return "vpc-0576efeea396efee2 (copilot-video-store-test)".
+// while VPCResource{"ID": "subnet-018ccb78d353cec9b", "Name": "public-subnet-1"}
+// will return "subnet-018ccb78d353cec9b (public-subnet-1)"
+func (r *Resource) String() string {
+	if r.Name != "" {
+		return fmt.Sprintf("%s (%s)", r.ID, r.Name)
+	}
+	return r.ID
+}
+
+// ExtractVPC extracts the vpc ID from the resource display string.
 // For example: vpc-0576efeea396efee2 (copilot-video-store-test)
 // will return VPC{ID: "vpc-0576efeea396efee2", Name: "copilot-video-store-test"}.
 func ExtractVPC(label string) (*VPC, error) {
-	if label == "" {
-		return nil, fmt.Errorf("extract VPC ID from string: %s", label)
-	}
-	splitVPC := strings.SplitN(label, " ", 2)
-	// TODO: switch to regex to make more robust
-	var name string
-	if len(splitVPC) == 2 {
-		name = strings.Trim(splitVPC[1], "()")
+	resource, err := extractResource(label)
+	if err != nil {
+		return nil, err
 	}
 	return &VPC{
-		ID:   splitVPC[0],
+		Resource: *resource,
+	}, nil
+}
+
+// ExtractSubnet extracts the subnet ID from the resource display string.
+func ExtractSubnet(label string) (*Subnet, error) {
+	resource, err := extractResource(label)
+	if err != nil {
+		return nil, err
+	}
+	return &Subnet{
+		Resource: *resource,
+	}, nil
+}
+
+func extractResource(label string) (*Resource, error) {
+	if label == "" {
+		return nil, fmt.Errorf("extract resource ID from string: %s", label)
+	}
+	splitResource := strings.SplitN(label, " ", 2)
+	// TODO: switch to regex to make more robust
+	var name string
+	if len(splitResource) == 2 {
+		name = strings.Trim(splitResource[1], "()")
+	}
+	return &Resource{
+		ID:   splitResource[0],
 		Name: name,
 	}, nil
+}
+
+// PublicIP returns the public ip associated with the network interface.
+func (c *EC2) PublicIP(eni string) (string, error) {
+	response, err := c.client.DescribeNetworkInterfaces(&ec2.DescribeNetworkInterfacesInput{
+		NetworkInterfaceIds: aws.StringSlice([]string{eni}),
+	})
+	if err != nil {
+		return "", fmt.Errorf("describe network interface with ENI %s: %w", eni, err)
+	}
+
+	// `response.NetworkInterfaces` contains at least one result; if no matching ENI is found, the API call will return
+	// an error instead of an empty list of `NetworkInterfaces` (https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeNetworkInterfaces.html)
+	association := response.NetworkInterfaces[0].Association
+	if association == nil {
+		return "", fmt.Errorf("no association information found for ENI %s", eni)
+	}
+
+	return aws.StringValue(association.PublicIp), nil
 }
 
 // ListVPCs returns names and IDs (or just IDs, if Name tag does not exist) of all VPCs.
@@ -147,11 +192,40 @@ func (c *EC2) ListVPCs() ([]VPC, error) {
 			}
 		}
 		vpcs = append(vpcs, VPC{
-			ID:   aws.StringValue(vpc.VpcId),
-			Name: name,
+			Resource: Resource{
+				ID:   aws.StringValue(vpc.VpcId),
+				Name: name,
+			},
 		})
 	}
 	return vpcs, nil
+}
+
+// ListAZs returns the list of opted-in and available availability zones.
+func (c *EC2) ListAZs() ([]AZ, error) {
+	resp, err := c.client.DescribeAvailabilityZones(&ec2.DescribeAvailabilityZonesInput{
+		Filters: []*ec2.Filter{
+			{
+				Name:   aws.String("zone-type"),
+				Values: aws.StringSlice([]string{"availability-zone"}),
+			},
+			{
+				Name:   aws.String("state"),
+				Values: aws.StringSlice([]string{"available"}),
+			},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("describe availability zones: %w", err)
+	}
+	var out []AZ
+	for _, az := range resp.AvailabilityZones {
+		out = append(out, AZ{
+			ID:   aws.StringValue(az.ZoneId),
+			Name: aws.StringValue(az.ZoneName),
+		})
+	}
+	return out, nil
 }
 
 // HasDNSSupport returns if DNS resolution is enabled for the VPC.
@@ -166,23 +240,55 @@ func (c *EC2) HasDNSSupport(vpcID string) (bool, error) {
 	return aws.BoolValue(resp.EnableDnsSupport.Value), nil
 }
 
-// ListVPCSubnets lists all subnets given a VPC ID.
-func (c *EC2) ListVPCSubnets(vpcID string, opts ...ListVPCSubnetsOpts) ([]string, error) {
-	respSubnets, err := c.subnets(Filter{
+// VPCSubnets are all subnets within a VPC.
+type VPCSubnets struct {
+	Public  []Subnet
+	Private []Subnet
+}
+
+// ListVPCSubnets lists all subnets with a given VPC ID. Note that public subnets
+// are subnets associated with an internet gateway through a route table.
+// And the rest of the subnets are private.
+func (c *EC2) ListVPCSubnets(vpcID string) (*VPCSubnets, error) {
+	vpcFilter := Filter{
 		Name:   "vpc-id",
 		Values: []string{vpcID},
-	})
+	}
+	routeTables, err := c.routeTables(vpcFilter)
 	if err != nil {
 		return nil, err
 	}
-	for _, opt := range opts {
-		respSubnets = opt(respSubnets)
+	rtIndex := indexRouteTables(routeTables)
+
+	var publicSubnets, privateSubnets []Subnet
+	respSubnets, err := c.subnets(vpcFilter)
+	if err != nil {
+		return nil, err
 	}
-	var subnets []string
 	for _, subnet := range respSubnets {
-		subnets = append(subnets, aws.StringValue(subnet.SubnetId))
+		var name string
+		for _, tag := range subnet.Tags {
+			if aws.StringValue(tag.Key) == "Name" {
+				name = aws.StringValue(tag.Value)
+			}
+		}
+		s := Subnet{
+			Resource: Resource{
+				ID:   aws.StringValue(subnet.SubnetId),
+				Name: name,
+			},
+			CIDRBlock: aws.StringValue(subnet.CidrBlock),
+		}
+		if rtIndex.IsPublicSubnet(s.ID) {
+			publicSubnets = append(publicSubnets, s)
+		} else {
+			privateSubnets = append(privateSubnets, s)
+		}
 	}
-	return subnets, nil
+	return &VPCSubnets{
+		Public:  publicSubnets,
+		Private: privateSubnets,
+	}, nil
 }
 
 // SubnetIDs finds the subnet IDs with optional filters.
@@ -195,22 +301,6 @@ func (c *EC2) SubnetIDs(filters ...Filter) ([]string, error) {
 	subnetIDs := make([]string, len(subnets))
 	for idx, subnet := range subnets {
 		subnetIDs[idx] = aws.StringValue(subnet.SubnetId)
-	}
-	return subnetIDs, nil
-}
-
-// PublicSubnetIDs finds the public subnet IDs with optional filters.
-func (c *EC2) PublicSubnetIDs(filters ...Filter) ([]string, error) {
-	subnets, err := c.subnets(filters...)
-	if err != nil {
-		return nil, err
-	}
-
-	var subnetIDs []string
-	for _, subnet := range subnets {
-		if aws.BoolValue(subnet.MapPublicIpOnLaunch) {
-			subnetIDs = append(subnetIDs, aws.StringValue(subnet.SubnetId))
-		}
 	}
 	return subnetIDs, nil
 }
@@ -244,7 +334,6 @@ func (c *EC2) subnets(filters ...Filter) ([]*ec2.Subnet, error) {
 		return nil, fmt.Errorf("describe subnets: %w", err)
 	}
 	subnets = append(subnets, response.Subnets...)
-
 	for response.NextToken != nil {
 		response, err = c.client.DescribeSubnets(&ec2.DescribeSubnetsInput{
 			Filters:   inputFilters,
@@ -255,8 +344,29 @@ func (c *EC2) subnets(filters ...Filter) ([]*ec2.Subnet, error) {
 		}
 		subnets = append(subnets, response.Subnets...)
 	}
-
+	if len(subnets) == 0 {
+		return nil, fmt.Errorf("cannot find any subnets")
+	}
 	return subnets, nil
+}
+
+func (c *EC2) routeTables(filters ...Filter) ([]*ec2.RouteTable, error) {
+	var routeTables []*ec2.RouteTable
+	input := &ec2.DescribeRouteTablesInput{
+		Filters: toEC2Filter(filters),
+	}
+	for {
+		resp, err := c.client.DescribeRouteTables(input)
+		if err != nil {
+			return nil, fmt.Errorf("describe route tables: %w", err)
+		}
+		routeTables = append(routeTables, resp.RouteTables...)
+		if resp.NextToken == nil {
+			break
+		}
+		input.NextToken = resp.NextToken
+	}
+	return routeTables, nil
 }
 
 func toEC2Filter(filters []Filter) []*ec2.Filter {
@@ -268,4 +378,119 @@ func toEC2Filter(filters []Filter) []*ec2.Filter {
 		})
 	}
 	return ec2Filter
+}
+
+type routeTable ec2.RouteTable
+
+// IsMain returns true if the route table is the default route table for the VPC.
+// If a subnet is not associated with a particular route table, then it will default to the main route table.
+func (rt *routeTable) IsMain() bool {
+	for _, association := range rt.Associations {
+		if aws.BoolValue(association.Main) {
+			return true
+		}
+	}
+	return false
+}
+
+// HasIGW returns true if the route table has a route to an internet gateway.
+func (rt *routeTable) HasIGW() bool {
+	for _, route := range rt.Routes {
+		if strings.HasPrefix(aws.StringValue(route.GatewayId), internetGatewayIDPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// AssociatedSubnets returns the list of subnet IDs associated with the route table.
+func (rt *routeTable) AssociatedSubnets() []string {
+	var subnetIDs []string
+	for _, association := range rt.Associations {
+		if association.SubnetId == nil {
+			continue
+		}
+		subnetIDs = append(subnetIDs, aws.StringValue(association.SubnetId))
+	}
+	return subnetIDs
+}
+
+// routeTableIndex holds cached data to quickly return information about route tables in a VPC.
+type routeTableIndex struct {
+	// Route table that subnets default to. There is always one main table in the VPC.
+	mainTable *routeTable
+
+	// Explicit route table association for a subnet. A subnet can only be associated to one route table.
+	routeTableForSubnet map[string]*routeTable
+}
+
+func indexRouteTables(tables []*ec2.RouteTable) *routeTableIndex {
+	index := &routeTableIndex{
+		routeTableForSubnet: make(map[string]*routeTable),
+	}
+	for _, table := range tables { // Index all properties in a single pass.
+		table := (*routeTable)(table)
+
+		for _, subnetID := range table.AssociatedSubnets() {
+			index.routeTableForSubnet[subnetID] = table
+		}
+
+		if table.IsMain() {
+			index.mainTable = table
+		}
+	}
+	return index
+}
+
+// IsPublicSubnet returns true if the subnet has a route to an internet gateway.
+// We consider the subnet to have internet access if there is an explicit route in the route table to an internet gateway.
+// Or if there is an implicit route, where the subnet defaults to the main route table with an internet gateway.
+func (idx *routeTableIndex) IsPublicSubnet(subnetID string) bool {
+	rt, ok := idx.routeTableForSubnet[subnetID]
+	if ok {
+		return rt.HasIGW()
+	}
+	return idx.mainTable.HasIGW()
+}
+
+// managedPrefixList returns the DescribeManagedPrefixListsOutput of a query by name.
+func (c *EC2) managedPrefixList(prefixListName string) (*ec2.DescribeManagedPrefixListsOutput, error) {
+	prefixListOutput, err := c.client.DescribeManagedPrefixLists(&ec2.DescribeManagedPrefixListsInput{
+		Filters: []*ec2.Filter{
+			{
+				Name:   aws.String("prefix-list-name"),
+				Values: aws.StringSlice([]string{prefixListName}),
+			},
+		},
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("describe managed prefix list with name %s: %w", prefixListName, err)
+	}
+
+	return prefixListOutput, nil
+}
+
+// CloudFrontManagedPrefixListID returns the PrefixListId of the associated cloudfront prefix list as a *string.
+func (c *EC2) CloudFrontManagedPrefixListID() (string, error) {
+	prefixListsOutput, err := c.managedPrefixList(cloudFrontPrefixListName)
+
+	if err != nil {
+		return "", err
+	}
+
+	var ids []string
+	for _, v := range prefixListsOutput.PrefixLists {
+		ids = append(ids, *v.PrefixListId)
+	}
+
+	if len(ids) == 0 {
+		return "", fmt.Errorf("cannot find any prefix list with name: %s", cloudFrontPrefixListName)
+	}
+
+	if len(ids) > 1 {
+		return "", fmt.Errorf("found more than one prefix list with the name %s: %v", cloudFrontPrefixListName, ids)
+	}
+
+	return ids[0], nil
 }

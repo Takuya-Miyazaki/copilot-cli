@@ -7,17 +7,18 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/service/ssm"
+	"github.com/aws/copilot-cli/internal/pkg/aws/identity"
+	"github.com/aws/copilot-cli/internal/pkg/aws/sessions"
+	"github.com/spf13/afero"
+
+	"github.com/aws/copilot-cli/internal/pkg/cli/list"
 	"github.com/aws/copilot-cli/internal/pkg/config"
-	"github.com/aws/copilot-cli/internal/pkg/list"
 	"github.com/aws/copilot-cli/internal/pkg/term/prompt"
 	"github.com/aws/copilot-cli/internal/pkg/term/selector"
 	"github.com/aws/copilot-cli/internal/pkg/workspace"
 	"github.com/spf13/cobra"
-)
-
-const (
-	svcListAppNamePrompt = "Which application's services would you like to list?"
-	wkldListAppNameHelp  = "An application groups all of your services and jobs together."
 )
 
 type listWkldVars struct {
@@ -35,14 +36,17 @@ type listSvcOpts struct {
 }
 
 func newListSvcOpts(vars listWkldVars) (*listSvcOpts, error) {
-	store, err := config.NewStore()
+	ws, err := workspace.Use(afero.NewOsFs())
 	if err != nil {
 		return nil, err
 	}
-	ws, err := workspace.New()
+
+	sess, err := sessions.ImmutableProvider(sessions.UserAgentExtras("svc ls")).Default()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("default session: %v", err)
 	}
+
+	store := config.NewSSMStore(identity.New(sess), ssm.New(sess), aws.StringValue(sess.Config.Region))
 	svcLister := &list.SvcListWriter{
 		Ws:    ws,
 		Store: store,
@@ -56,17 +60,24 @@ func newListSvcOpts(vars listWkldVars) (*listSvcOpts, error) {
 		listWkldVars: vars,
 
 		list: svcLister,
-		sel:  selector.NewSelect(prompt.New(), store),
+		sel:  selector.NewAppEnvSelector(prompt.New(), store),
 	}, nil
 }
 
-// Ask asks for fields that are required but not passed in.
+// Validate is a no-op for this command.
+func (o *listSvcOpts) Validate() error {
+	return nil
+}
+
+// Ask prompts for and validates any required flags.
 func (o *listSvcOpts) Ask() error {
 	if o.appName != "" {
+		// NOTE: Skip validating app name here because `Execute` will fail pretty soon with a clear error message.
+		// The validation (config.GetApplication) would only add additional operation time in this particular case.
 		return nil
 	}
 
-	name, err := o.sel.Application(svcListAppNamePrompt, wkldListAppNameHelp)
+	name, err := o.sel.Application(svcAppNamePrompt, wkldAppNameHelpPrompt)
 	if err != nil {
 		return fmt.Errorf("select application name: %w", err)
 	}
@@ -76,7 +87,6 @@ func (o *listSvcOpts) Ask() error {
 
 // Execute lists the services through the prompt.
 func (o *listSvcOpts) Execute() error {
-
 	if err := o.list.Write(o.appName); err != nil {
 		return err
 	}

@@ -16,6 +16,7 @@ import (
 	"github.com/aws/copilot-cli/internal/pkg/template/mocks"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -24,6 +25,7 @@ const (
 
 func TestAppTemplate(t *testing.T) {
 	testCases := map[string]struct {
+		inVersion        string
 		mockDependencies func(ctrl *gomock.Controller, c *AppStackConfig)
 
 		wantedTemplate string
@@ -32,16 +34,29 @@ func TestAppTemplate(t *testing.T) {
 		"should return error given template not found": {
 			mockDependencies: func(ctrl *gomock.Controller, c *AppStackConfig) {
 				m := mocks.NewMockReadParser(ctrl)
-				m.EXPECT().Read(appTemplatePath).Return(nil, errors.New("some error"))
+				m.EXPECT().Parse(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, errors.New("some error"))
 				c.parser = m
 			},
 
 			wantedError: errors.New("some error"),
 		},
-		"should return template body when present": {
+		"success": {
+			inVersion: "v1.0.0",
 			mockDependencies: func(ctrl *gomock.Controller, c *AppStackConfig) {
 				m := mocks.NewMockReadParser(ctrl)
-				m.EXPECT().Read(appTemplatePath).Return(&template.Content{
+				m.EXPECT().Parse(appTemplatePath, struct {
+					TemplateVersion         string
+					AppDNSDelegatedAccounts []string
+					Domain                  string
+					Name                    string
+					PermissionsBoundary     string
+				}{
+					"v1.0.0",
+					[]string{"123456"},
+					"",
+					"demo",
+					"",
+				}, gomock.Any()).Return(&template.Content{
 					Buffer: bytes.NewBufferString("template"),
 				}, nil)
 				c.parser = m
@@ -56,7 +71,15 @@ func TestAppTemplate(t *testing.T) {
 			// GIVEN
 			ctrl := gomock.NewController(t)
 			defer ctrl.Finish()
-			appStack := &AppStackConfig{}
+			appStack := &AppStackConfig{
+				CreateAppInput: &deploy.CreateAppInput{
+					Version:             tc.inVersion,
+					AccountID:           "123456",
+					Name:                "demo",
+					DomainName:          "",
+					PermissionsBoundary: "",
+				},
+			}
 			tc.mockDependencies(ctrl, appStack)
 
 			// WHEN
@@ -128,23 +151,31 @@ func TestAppResourceTemplate(t *testing.T) {
 		"should render template after sorting": {
 			given: &AppResourcesConfig{
 				Accounts: []string{"4567", "1234"},
-				Services: []string{"app-2", "app-1"},
-				Version:  1,
-				App:      "testapp",
+				Workloads: []AppResourcesWorkload{
+					{Name: "svc-2"},
+					{Name: "svc-1"},
+				},
+				Version: 1,
+				App:     "testapp",
 			},
 			mockDependencies: func(ctrl *gomock.Controller, c *AppStackConfig) {
 				m := mocks.NewMockReadParser(ctrl)
 				m.EXPECT().Parse(appResourcesTemplatePath, struct {
 					*AppResourcesConfig
-					ServiceTagKey string
+					ServiceTagKey   string
+					TemplateVersion string
 				}{
 					&AppResourcesConfig{
 						Accounts: []string{"1234", "4567"},
-						Services: []string{"app-1", "app-2"},
-						Version:  1,
-						App:      "testapp",
+						Workloads: []AppResourcesWorkload{
+							{Name: "svc-1"},
+							{Name: "svc-2"},
+						},
+						Version: 1,
+						App:     "testapp",
 					},
 					deploy.ServiceTagKey,
+					"",
 				}, gomock.Any()).Return(&template.Content{
 					Buffer: bytes.NewBufferString("template"),
 				}, nil)
@@ -191,6 +222,10 @@ func TestAppParameters(t *testing.T) {
 			ParameterValue: aws.String("amazon.com"),
 		},
 		{
+			ParameterKey:   aws.String(appDomainHostedZoneIDKey),
+			ParameterValue: aws.String("mockHostedZoneID"),
+		},
+		{
 			ParameterKey:   aws.String(appDNSDelegationRoleParamName),
 			ParameterValue: aws.String("testapp-DNSDelegationRole"),
 		},
@@ -200,7 +235,7 @@ func TestAppParameters(t *testing.T) {
 		},
 	}
 	app := &AppStackConfig{
-		CreateAppInput: &deploy.CreateAppInput{Name: "testapp", AccountID: "1234", DomainName: "amazon.com"},
+		CreateAppInput: &deploy.CreateAppInput{Name: "testapp", AccountID: "1234", DomainName: "amazon.com", DomainHostedZoneID: "mockHostedZoneID"},
 	}
 	params, _ := app.Parameters()
 	require.ElementsMatch(t, expectedParams, params)
@@ -376,6 +411,92 @@ Metadata:
 	require.Equal(t, AppResourcesConfig{
 		Accounts: []string{"0000000000"},
 		Version:  7,
-		Services: []string{"testsvc1", "testsvc2"},
+		Workloads: []AppResourcesWorkload{
+			{Name: "testsvc1", WithECR: true},
+			{Name: "testsvc2", WithECR: true},
+		},
 	}, *config)
+}
+
+func TestAppResourcesService_UnmarshalYAML(t *testing.T) {
+	testCases := map[string]struct {
+		in          []byte
+		wanted      AppResourcesConfig
+		wantedError error
+	}{
+		"unmarshal legacy service config": {
+			in: []byte(`Services:
+  - frontend
+  - backend
+TemplateVersion: 'v1.1.0'
+Version: 6
+App: demo
+Accounts:
+  - 1234567890`),
+			wanted: AppResourcesConfig{
+				Workloads: []AppResourcesWorkload{
+					{Name: "frontend", WithECR: true},
+					{Name: "backend", WithECR: true},
+				},
+				Accounts: []string{"1234567890"},
+				Version:  6,
+				App:      "demo",
+			},
+		},
+		"unmarshal v1.28, v1.29 service config field": {
+			in: []byte(`Workloads:
+  - Name: frontend
+    WithECR: true
+  - Name: backend
+    WithECR: false
+TemplateVersion: 'v1.1.0'
+Version: 6
+App: demo
+Accounts:
+  - 1234567890`),
+			wanted: AppResourcesConfig{
+				Workloads: []AppResourcesWorkload{
+					{Name: "frontend", WithECR: true},
+					{Name: "backend", WithECR: false},
+				},
+				Accounts: []string{"1234567890"},
+				Version:  6,
+				App:      "demo",
+			},
+		},
+		"unmarshal new service config": {
+			in: []byte(`Workloads:
+  - Name: frontend
+    WithECR: true
+  - Name: backend
+    WithECR: false
+TemplateVersion: 'v1.1.0'
+Services: "See #5140"
+Version: 6
+App: demo
+Accounts:
+  - 1234567890`),
+			wanted: AppResourcesConfig{
+				Workloads: []AppResourcesWorkload{
+					{Name: "frontend", WithECR: true},
+					{Name: "backend", WithECR: false},
+				},
+				Accounts: []string{"1234567890"},
+				Version:  6,
+				App:      "demo",
+			},
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			var s AppResources
+			err := yaml.Unmarshal(tc.in, &s)
+			if tc.wantedError != nil {
+				require.EqualError(t, err, tc.wantedError.Error())
+			} else {
+				require.NoError(t, err)
+				require.Equal(t, tc.wanted, s.AppResourcesConfig)
+			}
+		})
+	}
 }

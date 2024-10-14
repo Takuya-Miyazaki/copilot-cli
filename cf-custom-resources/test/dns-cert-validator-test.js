@@ -3,59 +3,270 @@
 "use strict";
 
 describe("DNS Validated Certificate Handler", () => {
-  const AWS = require("aws-sdk-mock");
+  const r53 = require("@aws-sdk/client-route-53");
+  const acm = require("@aws-sdk/client-acm");
+  const{mockClient} = require("aws-sdk-client-mock");
   const LambdaTester = require("lambda-tester").noVersionCheck();
   const sinon = require("sinon");
   const handler = require("../lib/dns-cert-validator");
   const nock = require("nock");
   const ResponseURL = "https://cloudwatch-response-mock.example.com/";
+  const LogGroup = "/aws/lambda/testLambda";
+  const LogStream = "2021/06/28/[$LATEST]9b93a7dca7344adeb193d15c092dbbfd";
+  const r53Mock = mockClient(r53.Route53Client);
+  const acmMock = mockClient(acm.ACMClient);
 
   let origLog = console.log;
   const testRequestId = "f4ef1b10-c39a-44e3-99c0-fbf7e53c3943";
-  const testDomainName = "test.example.com";
-  const testHostedZoneId = "/hostedzone/Z3P5QSUBK4POTI";
+  const testAppName = "myapp";
+  const testEnvName = "test";
+  const testDomainName = "example.com";
+  const testHostedZoneId = "Z3P5QSUBK4POTI";
+  const testAppHostedZoneId = "K4POTIZ3P5QSUB";
+  const testRootDNSRole = "mockRole";
+  const testAliases = `{
+    "frontend": ["v1.${testAppName}.${testDomainName}", "foobar.com"],
+    "backend": ["v2.${testDomainName}", "${testEnvName}.${testAppName}.${testDomainName}"]
+  }`;
+  const testUpdatedAliases = `{
+    "frontend": ["v1.${testAppName}.${testDomainName}"],
+    "backend": ["v2.${testDomainName}", "${testEnvName}.${testAppName}.${testDomainName}"]
+  }`;
+  const testSANs = [
+    "test.myapp.example.com",
+    "*.test.myapp.example.com",
+    "v1.myapp.example.com",
+    "v2.example.com",
+  ];
+  const testCopilotTags = [
+    { Key: "copilot-application", Value: testAppName },
+    { Key: "copilot-environment", Value: testEnvName },
+  ];
   const testCertificateArn =
     "arn:aws:acm:region:123456789012:certificate/12345678-1234-1234-1234-123456789012";
+  const testOtherCertificateArn =
+    "arn:aws:acm:region:123456789012:certificate/1234-1234-123456789012-12345678-1234";
   const testRRName = "_3639ac514e785e898d2646601fa951d5.example.com";
-  const testRRValue = "_x2.acm-validations.aws";
+  const testRRValue1 = "_x1.acm-validations.aws";
+  const testRRValue2 = "_x2.acm-validations.aws";
+  const testRRValue3 = "_x3.acm-validations.aws";
   const spySleep = sinon.spy(function (ms) {
     return Promise.resolve();
   });
+  const testDeleteRecordChangebatch1 = {
+    Changes: [
+      {
+        Action: "DELETE",
+        ResourceRecordSet: {
+          Name: testRRName,
+          Type: "CNAME",
+          TTL: 60,
+          ResourceRecords: [
+            {
+              Value: testRRValue1,
+            },
+          ],
+        },
+      },
+    ],
+  };
+  const testDeleteRecordChangebatch3 = {
+    Changes: [
+      {
+        Action: "DELETE",
+        ResourceRecordSet: {
+          Name: testRRName,
+          Type: "CNAME",
+          TTL: 60,
+          ResourceRecords: [
+            {
+              Value: testRRValue3,
+            },
+          ],
+        },
+      },
+    ],
+  };
+  const testUpsertRecordChangebatch1 = {
+    Changes: [
+      {
+        Action: "UPSERT",
+        ResourceRecordSet: {
+          Name: testRRName,
+          Type: "CNAME",
+          TTL: 60,
+          ResourceRecords: [
+            {
+              Value: testRRValue1,
+            },
+          ],
+        },
+      },
+    ],
+  };
+  const testUpsertRecordChangebatch2 = {
+    Changes: [
+      {
+        Action: "UPSERT",
+        ResourceRecordSet: {
+          Name: testRRName,
+          Type: "CNAME",
+          TTL: 60,
+          ResourceRecords: [
+            {
+              Value: testRRValue2,
+            },
+          ],
+        },
+      },
+    ],
+  };
+  const testUpsertRecordChangebatch3 = {
+    Changes: [
+      {
+        Action: "UPSERT",
+        ResourceRecordSet: {
+          Name: testRRName,
+          Type: "CNAME",
+          TTL: 60,
+          ResourceRecords: [
+            {
+              Value: testRRValue3,
+            },
+          ],
+        },
+      },
+    ],
+  };
+  const legacyCertValidatorOptions = [
+    {
+      DomainName: `${testEnvName}.${testAppName}.${testDomainName}`,
+      ValidationStatus: "SUCCESS",
+      ResourceRecord: {
+        Name: testRRName,
+        Type: "CNAME",
+        Value: testRRValue1,
+      },
+    },
+    {
+      DomainName: `*.${testEnvName}.${testAppName}.${testDomainName}`,
+      ValidationStatus: "SUCCESS",
+      ResourceRecord: {
+        Name: testRRName,
+        Type: "CNAME",
+        Value: testRRValue1,
+      },
+    },
+  ];
+  const newCertValidatorOptionsWithoutV2 = [
+    {
+      DomainName: `${testEnvName}.${testAppName}.${testDomainName}`,
+      ValidationStatus: "SUCCESS",
+      ResourceRecord: {
+        Name: testRRName,
+        Type: "CNAME",
+        Value: testRRValue1,
+      },
+    },
+    {
+      DomainName: `*.${testEnvName}.${testAppName}.${testDomainName}`,
+      ValidationStatus: "SUCCESS",
+      ResourceRecord: {
+        Name: testRRName,
+        Type: "CNAME",
+        Value: testRRValue1,
+      },
+    },
+    {
+      DomainName: `v1.${testAppName}.${testDomainName}`,
+      ValidationStatus: "PENDING_VALIDATION",
+      ResourceRecord: {
+        Name: testRRName,
+        Type: "CNAME",
+        Value: testRRValue2,
+      },
+    },
+  ];
+  const newCertValidateOptions = [
+    {
+      DomainName: `${testEnvName}.${testAppName}.${testDomainName}`,
+      ValidationStatus: "PENDING_VALIDATION",
+      ResourceRecord: {
+        Name: testRRName,
+        Type: "CNAME",
+        Value: testRRValue1,
+      },
+    },
+    {
+      DomainName: `*.${testEnvName}.${testAppName}.${testDomainName}`,
+      ValidationStatus: "PENDING_VALIDATION",
+      ResourceRecord: {
+        Name: testRRName,
+        Type: "CNAME",
+        Value: testRRValue1,
+      },
+    },
+    {
+      DomainName: `v1.${testAppName}.${testDomainName}`,
+      ValidationStatus: "PENDING_VALIDATION",
+      ResourceRecord: {
+        Name: testRRName,
+        Type: "CNAME",
+        Value: testRRValue2,
+      },
+    },
+    {
+      DomainName: `v2.${testDomainName}`,
+      ValidationStatus: "PENDING_VALIDATION",
+      ResourceRecord: {
+        Name: testRRName,
+        Type: "CNAME",
+        Value: testRRValue3,
+      },
+    },
+  ];
 
   beforeEach(() => {
     handler.withDefaultResponseURL(ResponseURL);
-    handler.withWaiter(function () {
-      // Mock waiter is merely a self-fulfilling promise
-      return {
-        promise: () => {
-          return new Promise((resolve) => {
-            resolve();
-          });
-        },
-      };
-    });
+    handler.withDefaultLogGroup(LogGroup);
+    handler.withDefaultLogStream(LogStream);
     handler.withSleep(spySleep);
     console.log = function () {};
+    handler.waitForCertificateValidation = async function () { };
+    handler.waitForRecordChange = async function () { };
   });
   afterEach(() => {
     // Restore waiters and logger
     handler.reset();
-    AWS.restore();
+    r53Mock.reset();
+    acmMock.reset();
     console.log = origLog;
     spySleep.resetHistory();
   });
 
-  test("Empty event payload fails", () => {
+  test("Empty event payload type fails", () => {
     const request = nock(ResponseURL)
       .put("/", (body) => {
         return (
           body.Status === "FAILED" &&
-          body.Reason === "Unsupported request type undefined"
+          body.Reason ===
+            "Unsupported request type undefined (Log: /aws/lambda/testLambda/2021/06/28/[$LATEST]9b93a7dca7344adeb193d15c092dbbfd)"
         );
       })
       .reply(200);
     return LambdaTester(handler.certificateRequestHandler)
-      .event({})
+      .event({
+        RequestId: testRequestId,
+        ResourceProperties: {
+          AppName: testAppName,
+          EnvName: testEnvName,
+          DomainName: testDomainName,
+          EnvHostedZoneId: testHostedZoneId,
+          Aliases: testAliases,
+          Region: "us-east-1",
+          RootDNSRole: testRootDNSRole,
+        },
+      })
       .expectResolve(() => {
         expect(request.isDone()).toBe(true);
       });
@@ -67,20 +278,33 @@ describe("DNS Validated Certificate Handler", () => {
       .put("/", (body) => {
         return (
           body.Status === "FAILED" &&
-          body.Reason === "Unsupported request type " + bogusType
+          body.Reason ===
+            "Unsupported request type " +
+              bogusType +
+              " (Log: /aws/lambda/testLambda/2021/06/28/[$LATEST]9b93a7dca7344adeb193d15c092dbbfd)"
         );
       })
       .reply(200);
     return LambdaTester(handler.certificateRequestHandler)
       .event({
         RequestType: bogusType,
+        RequestId: testRequestId,
+        ResourceProperties: {
+          AppName: testAppName,
+          EnvName: testEnvName,
+          DomainName: testDomainName,
+          EnvHostedZoneId: testHostedZoneId,
+          Aliases: testAliases,
+          Region: "us-east-1",
+          RootDNSRole: testRootDNSRole,
+        },
       })
       .expectResolve(() => {
         expect(request.isDone()).toBe(true);
       });
   });
 
-  test("Create operation requests a certificate", () => {
+  test("Update operation requests a new certificate", () => {
     const requestCertificateFake = sinon.fake.resolves({
       CertificateArn: testCertificateArn,
     });
@@ -94,16 +318,7 @@ describe("DNS Validated Certificate Handler", () => {
     describeCertificateFake.resolves({
       Certificate: {
         CertificateArn: testCertificateArn,
-        DomainValidationOptions: [
-          {
-            ValidationStatus: "SUCCESS",
-            ResourceRecord: {
-              Name: testRRName,
-              Type: "CNAME",
-              Value: testRRValue,
-            },
-          },
-        ],
+        DomainValidationOptions: newCertValidateOptions,
       },
     });
 
@@ -113,13 +328,154 @@ describe("DNS Validated Certificate Handler", () => {
       },
     });
 
-    AWS.mock("ACM", "requestCertificate", requestCertificateFake);
-    AWS.mock("ACM", "describeCertificate", describeCertificateFake);
-    AWS.mock(
-      "Route53",
-      "changeResourceRecordSets",
-      changeResourceRecordSetsFake
-    );
+    const listHostedZonesByNameFake = sinon.fake.resolves({
+      HostedZones: [
+        {
+          Id: `/hostedzone/${testHostedZoneId}`,
+        },
+      ],
+    });
+
+    acmMock.on(acm.RequestCertificateCommand).callsFake(requestCertificateFake);
+    acmMock.on(acm.DescribeCertificateCommand).callsFake(describeCertificateFake);
+    r53Mock.on(r53.ChangeResourceRecordSetsCommand).callsFake(changeResourceRecordSetsFake);
+    r53Mock.on(r53.ListHostedZonesByNameCommand).callsFake(listHostedZonesByNameFake);
+
+    const request = nock(ResponseURL)
+      .put("/", (body) => {
+        return body.Status === "SUCCESS";
+      })
+      .reply(200);
+
+    return LambdaTester(handler.certificateRequestHandler)
+      .event({
+        RequestType: "Update",
+        RequestId: testRequestId,
+        ResourceProperties: {
+          AppName: testAppName,
+          EnvName: testEnvName,
+          DomainName: testDomainName,
+          EnvHostedZoneId: testHostedZoneId,
+          Aliases: testAliases,
+          Region: "us-east-1",
+          RootDNSRole: testRootDNSRole,
+        },
+        OldResourceProperties: {},
+      })
+      .expectResolve(() => {
+        sinon.assert.calledWith(
+          describeCertificateFake,
+          sinon.match({
+            CertificateArn: testCertificateArn,
+          })
+        );
+        sinon.assert.calledWith(
+          requestCertificateFake,
+          sinon.match({
+            DomainName: `${testEnvName}.${testAppName}.${testDomainName}`,
+            SubjectAlternativeNames: testSANs,
+            ValidationMethod: "DNS",
+            Tags: testCopilotTags,
+          })
+        );
+        sinon.assert.calledWith(
+          changeResourceRecordSetsFake,
+          sinon.match({
+            ChangeBatch: testUpsertRecordChangebatch1,
+            HostedZoneId: testHostedZoneId,
+          })
+        );
+        sinon.assert.calledWith(
+          changeResourceRecordSetsFake,
+          sinon.match({
+            ChangeBatch: testUpsertRecordChangebatch2,
+            HostedZoneId: testHostedZoneId,
+          })
+        );
+        sinon.assert.calledWith(
+          changeResourceRecordSetsFake,
+          sinon.match({
+            ChangeBatch: testUpsertRecordChangebatch3,
+            HostedZoneId: testHostedZoneId,
+          })
+        );
+        sinon.assert.calledWith(
+          listHostedZonesByNameFake,
+          sinon.match({
+            DNSName: `${testDomainName}`,
+            MaxItems: "1",
+          })
+        );
+        sinon.assert.calledWith(
+          listHostedZonesByNameFake,
+          sinon.match({
+            DNSName: `${testAppName}.${testDomainName}`,
+            MaxItems: "1",
+          })
+        );
+        expect(request.isDone()).toBe(true);
+      });
+  });
+
+  test("Update operation quits early if cert doesn't change", () => {
+    const request = nock(ResponseURL)
+      .put("/", (body) => {
+        return (
+          body.Status === "SUCCESS" && body.PhysicalResourceId === "mockCertArn"
+        );
+      })
+      .reply(200);
+
+    return LambdaTester(handler.certificateRequestHandler)
+      .event({
+        RequestType: "Update",
+        RequestId: testRequestId,
+        PhysicalResourceId: "mockCertArn",
+        ResourceProperties: {
+          AppName: testAppName,
+          EnvName: testEnvName,
+          DomainName: testDomainName,
+          Aliases: testAliases,
+          EnvHostedZoneId: testHostedZoneId,
+          Region: "us-east-1",
+          RootDNSRole: testRootDNSRole,
+        },
+        OldResourceProperties: {
+          Aliases: testUpdatedAliases,
+        },
+      })
+      .expectResolve(() => {
+        expect(request.isDone()).toBe(true);
+      });
+  });
+
+  test("Create operation requests a legacy certificate", () => {
+    const requestCertificateFake = sinon.fake.resolves({
+      CertificateArn: testCertificateArn,
+    });
+
+    const describeCertificateFake = sinon.stub();
+    describeCertificateFake.onFirstCall().resolves({
+      Certificate: {
+        CertificateArn: testCertificateArn,
+      },
+    });
+    describeCertificateFake.resolves({
+      Certificate: {
+        CertificateArn: testCertificateArn,
+        DomainValidationOptions: legacyCertValidatorOptions,
+      },
+    });
+
+    const changeResourceRecordSetsFake = sinon.fake.resolves({
+      ChangeInfo: {
+        Id: "bogus",
+      },
+    });
+
+    acmMock.on(acm.RequestCertificateCommand).callsFake(requestCertificateFake);
+    acmMock.on(acm.DescribeCertificateCommand).callsFake(describeCertificateFake);
+    r53Mock.on(r53.ChangeResourceRecordSetsCommand).callsFake(changeResourceRecordSetsFake);
 
     const request = nock(ResponseURL)
       .put("/", (body) => {
@@ -132,39 +488,37 @@ describe("DNS Validated Certificate Handler", () => {
         RequestType: "Create",
         RequestId: testRequestId,
         ResourceProperties: {
+          AppName: testAppName,
+          EnvName: testEnvName,
           DomainName: testDomainName,
-          HostedZoneId: testHostedZoneId,
+          EnvHostedZoneId: testHostedZoneId,
           Region: "us-east-1",
+          RootDNSRole: testRootDNSRole,
         },
       })
       .expectResolve(() => {
         sinon.assert.calledWith(
+          describeCertificateFake,
+          sinon.match({
+            CertificateArn: testCertificateArn,
+          })
+        );
+        sinon.assert.calledWith(
           requestCertificateFake,
           sinon.match({
-            DomainName: testDomainName,
+            DomainName: `${testEnvName}.${testAppName}.${testDomainName}`,
+            SubjectAlternativeNames: [
+              `${testEnvName}.${testAppName}.${testDomainName}`,
+              `*.${testEnvName}.${testAppName}.${testDomainName}`,
+            ],
             ValidationMethod: "DNS",
+            Tags: testCopilotTags,
           })
         );
         sinon.assert.calledWith(
           changeResourceRecordSetsFake,
           sinon.match({
-            ChangeBatch: {
-              Changes: [
-                {
-                  Action: "UPSERT",
-                  ResourceRecordSet: {
-                    Name: testRRName,
-                    Type: "CNAME",
-                    TTL: 60,
-                    ResourceRecords: [
-                      {
-                        Value: testRRValue,
-                      },
-                    ],
-                  },
-                },
-              ],
-            },
+            ChangeBatch: testUpsertRecordChangebatch1,
             HostedZoneId: testHostedZoneId,
           })
         );
@@ -182,10 +536,11 @@ describe("DNS Validated Certificate Handler", () => {
       Certificate: {
         CertificateArn: testCertificateArn,
       },
+      DomainValidationOptions: newCertValidateOptions,
     });
 
-    AWS.mock("ACM", "requestCertificate", requestCertificateFake);
-    AWS.mock("ACM", "describeCertificate", describeCertificateFake);
+    acmMock.on(acm.RequestCertificateCommand).callsFake(requestCertificateFake);
+    acmMock.on(acm.DescribeCertificateCommand).callsFake(describeCertificateFake);
 
     const request = nock(ResponseURL)
       .put("/", (body) => {
@@ -203,16 +558,21 @@ describe("DNS Validated Certificate Handler", () => {
         RequestType: "Create",
         RequestId: testRequestId,
         ResourceProperties: {
+          AppName: testAppName,
+          EnvName: testEnvName,
           DomainName: testDomainName,
-          HostedZoneId: testHostedZoneId,
+          EnvHostedZoneId: testHostedZoneId,
+          Aliases: testAliases,
           Region: "us-east-1",
+          RootDNSRole: testRootDNSRole,
         },
       })
       .expectResolve(() => {
         sinon.assert.calledWith(
           requestCertificateFake,
           sinon.match({
-            DomainName: testDomainName,
+            DomainName: `${testEnvName}.${testAppName}.${testDomainName}`,
+            SubjectAlternativeNames: testSANs,
             ValidationMethod: "DNS",
           })
         );
@@ -225,7 +585,7 @@ describe("DNS Validated Certificate Handler", () => {
       });
   });
 
-  test("Create operation fails within 360s and 10 attempts if certificate has no DomainValidationOptions", () => {
+  test("Create operation fails within 360s and 10 attempts if certificate has not enough DomainValidationOptions", () => {
     handler.withRandom(() => 1);
     const requestCertificateFake = sinon.fake.resolves({
       CertificateArn: testCertificateArn,
@@ -235,10 +595,11 @@ describe("DNS Validated Certificate Handler", () => {
       Certificate: {
         CertificateArn: testCertificateArn,
       },
+      DomainValidationOptions: legacyCertValidatorOptions,
     });
 
-    AWS.mock("ACM", "requestCertificate", requestCertificateFake);
-    AWS.mock("ACM", "describeCertificate", describeCertificateFake);
+    acmMock.on(acm.RequestCertificateCommand).callsFake(requestCertificateFake);
+    acmMock.on(acm.DescribeCertificateCommand).callsFake(describeCertificateFake);
 
     const request = nock(ResponseURL)
       .put("/", (body) => {
@@ -256,16 +617,21 @@ describe("DNS Validated Certificate Handler", () => {
         RequestType: "Create",
         RequestId: testRequestId,
         ResourceProperties: {
+          AppName: testAppName,
+          EnvName: testEnvName,
           DomainName: testDomainName,
-          HostedZoneId: testHostedZoneId,
+          Aliases: testAliases,
+          EnvHostedZoneId: testHostedZoneId,
           Region: "us-east-1",
+          RootDNSRole: testRootDNSRole,
         },
       })
       .expectResolve(() => {
         sinon.assert.calledWith(
           requestCertificateFake,
           sinon.match({
-            DomainName: testDomainName,
+            DomainName: `${testEnvName}.${testAppName}.${testDomainName}`,
+            SubjectAlternativeNames: testSANs,
             ValidationMethod: "DNS",
           })
         );
@@ -279,41 +645,104 @@ describe("DNS Validated Certificate Handler", () => {
       });
   });
 
-  test("Create operation with a maximum of 1 attempts describes the certificate once", () => {
-    handler.withMaxAttempts(1);
-
+  test("Create operation fails because no hosted zone found", () => {
     const requestCertificateFake = sinon.fake.resolves({
       CertificateArn: testCertificateArn,
     });
-    AWS.mock("ACM", "requestCertificate", requestCertificateFake);
 
-    const describeCertificateFake = sinon.fake.resolves({
+    const describeCertificateFake = sinon.stub();
+    describeCertificateFake.onFirstCall().resolves({
       Certificate: {
         CertificateArn: testCertificateArn,
-        DomainValidationOptions: [
-          {
-            ValidationStatus: "SUCCESS",
-            ResourceRecord: {
-              Name: testRRName,
-              Type: "CNAME",
-              Value: testRRValue,
-            },
-          },
-        ],
       },
     });
-    AWS.mock("ACM", "describeCertificate", describeCertificateFake);
+    describeCertificateFake.resolves({
+      Certificate: {
+        CertificateArn: testCertificateArn,
+        DomainValidationOptions: newCertValidateOptions,
+      },
+    });
 
     const changeResourceRecordSetsFake = sinon.fake.resolves({
       ChangeInfo: {
         Id: "bogus",
       },
     });
-    AWS.mock(
-      "Route53",
-      "changeResourceRecordSets",
-      changeResourceRecordSetsFake
-    );
+
+    const listHostedZonesByNameFake = sinon.fake.resolves({
+      HostedZones: [],
+    });
+
+    acmMock.on(acm.RequestCertificateCommand).callsFake(requestCertificateFake);
+    acmMock.on(acm.DescribeCertificateCommand).callsFake(describeCertificateFake);
+    r53Mock.on(r53.ChangeResourceRecordSetsCommand).callsFake(changeResourceRecordSetsFake);
+    r53Mock.on(r53.ListHostedZonesByNameCommand).callsFake(listHostedZonesByNameFake);
+
+    const request = nock(ResponseURL)
+      .put("/", (body) => {
+        return (
+          body.Status === "FAILED" &&
+          body.Reason.startsWith("Couldn't find any Hosted Zone")
+        );
+      })
+      .reply(200);
+
+    return LambdaTester(handler.certificateRequestHandler)
+      .event({
+        RequestType: "Create",
+        RequestId: testRequestId,
+        ResourceProperties: {
+          AppName: testAppName,
+          EnvName: testEnvName,
+          DomainName: testDomainName,
+          EnvHostedZoneId: testHostedZoneId,
+          Aliases: testAliases,
+          Region: "us-east-1",
+          RootDNSRole: testRootDNSRole,
+        },
+      })
+      .expectResolve(() => {
+        sinon.assert.calledWith(
+          requestCertificateFake,
+          sinon.match({
+            DomainName: `${testEnvName}.${testAppName}.${testDomainName}`,
+            SubjectAlternativeNames: testSANs,
+            ValidationMethod: "DNS",
+          })
+        );
+        sinon.assert.calledWith(
+          listHostedZonesByNameFake,
+          sinon.match({
+            DNSName: `${testAppName}.${testDomainName}`,
+            MaxItems: "1",
+          })
+        );
+        expect(request.isDone()).toBe(true);
+      });
+  });
+
+  test("Create operation with a maximum of 1 attempts describes the certificate once", () => {
+    handler.withMaxAttempts(1);
+
+    const requestCertificateFake = sinon.fake.resolves({
+      CertificateArn: testCertificateArn,
+    });
+    acmMock.on(acm.RequestCertificateCommand).callsFake(requestCertificateFake);
+
+    const describeCertificateFake = sinon.fake.resolves({
+      Certificate: {
+        CertificateArn: testCertificateArn,
+        DomainValidationOptions: legacyCertValidatorOptions,
+      },
+    });
+    acmMock.on(acm.DescribeCertificateCommand).callsFake(describeCertificateFake);
+
+    const changeResourceRecordSetsFake = sinon.fake.resolves({
+      ChangeInfo: {
+        Id: "bogus",
+      },
+    });
+    r53Mock.on(r53.ChangeResourceRecordSetsCommand).callsFake(changeResourceRecordSetsFake);
 
     const request = nock(ResponseURL)
       .put("/", (body) => {
@@ -326,9 +755,12 @@ describe("DNS Validated Certificate Handler", () => {
         RequestType: "Create",
         RequestId: testRequestId,
         ResourceProperties: {
+          AppName: testAppName,
+          EnvName: testEnvName,
           DomainName: testDomainName,
-          HostedZoneId: testHostedZoneId,
+          EnvHostedZoneId: testHostedZoneId,
           Region: "us-east-1",
+          RootDNSRole: testRootDNSRole,
         },
       })
       .expectResolve(() => {
@@ -343,16 +775,42 @@ describe("DNS Validated Certificate Handler", () => {
       });
   });
 
-  test("Delete operation deletes the certificate", () => {
+  test("Delete operation deletes the last cert", () => {
     const describeCertificateFake = sinon.fake.resolves({
       Certificate: {
         CertificateArn: testCertificateArn,
+        DomainValidationOptions: legacyCertValidatorOptions,
       },
     });
-    AWS.mock("ACM", "describeCertificate", describeCertificateFake);
+    acmMock.on(acm.DescribeCertificateCommand).callsFake(describeCertificateFake);
 
     const deleteCertificateFake = sinon.fake.resolves({});
-    AWS.mock("ACM", "deleteCertificate", deleteCertificateFake);
+    acmMock.on(acm.DeleteCertificateCommand).callsFake(deleteCertificateFake);
+
+    const listCertificatesFake = sinon.stub();
+    listCertificatesFake.onFirstCall().resolves({
+      CertificateSummaryList: [
+        {
+          DomainName: `${testEnvName}.${testAppName}.${testDomainName}`,
+          CertificateArn: testCertificateArn,
+        },
+      ],
+      NextToken: "some token",
+    });
+    listCertificatesFake.onSecondCall().resolves({
+      CertificateSummaryList: [
+        {
+          DomainName: "otherdomain.com",
+        },
+      ],
+    });
+    acmMock.on(acm.ListCertificatesCommand).callsFake(listCertificatesFake);
+    const changeResourceRecordSetsFake = sinon.fake.resolves({
+      ChangeInfo: {
+        Id: "bogus",
+      },
+    });
+    r53Mock.on(r53.ChangeResourceRecordSetsCommand).callsFake(changeResourceRecordSetsFake);
 
     const request = nock(ResponseURL)
       .put("/", (body) => {
@@ -366,8 +824,12 @@ describe("DNS Validated Certificate Handler", () => {
         RequestId: testRequestId,
         PhysicalResourceId: testCertificateArn,
         ResourceProperties: {
-          HostedZoneId: testHostedZoneId,
+          AppName: testAppName,
+          EnvName: testEnvName,
+          DomainName: testDomainName,
+          EnvHostedZoneId: testHostedZoneId,
           Region: "us-east-1",
+          RootDNSRole: testRootDNSRole,
         },
       })
       .expectResolve(() => {
@@ -375,6 +837,20 @@ describe("DNS Validated Certificate Handler", () => {
           describeCertificateFake,
           sinon.match({
             CertificateArn: testCertificateArn,
+          })
+        );
+        sinon.assert.calledWith(listCertificatesFake, sinon.match({}));
+        sinon.assert.calledWith(
+          listCertificatesFake,
+          sinon.match({
+            NextToken: "some token",
+          })
+        );
+        sinon.assert.calledWith(
+          changeResourceRecordSetsFake,
+          sinon.match({
+            ChangeBatch: testDeleteRecordChangebatch1,
+            HostedZoneId: testHostedZoneId,
           })
         );
         sinon.assert.calledWith(
@@ -387,15 +863,39 @@ describe("DNS Validated Certificate Handler", () => {
       });
   });
 
-  test("Delete operation is idempotent", () => {
-    const error = new Error();
-    error.name = "ResourceNotFoundException";
+  test("Delete operation deletes the cert without record removal", () => {
+    const describeCertificateFake = sinon.stub();
+    describeCertificateFake.onFirstCall().resolves({
+      Certificate: {
+        CertificateArn: testCertificateArn,
+        DomainValidationOptions: newCertValidatorOptionsWithoutV2,
+      },
+    });
+    describeCertificateFake.onSecondCall().resolves({
+      Certificate: {
+        CertificateArn: testOtherCertificateArn,
+        DomainValidationOptions: newCertValidateOptions,
+      },
+    });
+    acmMock.on(acm.DescribeCertificateCommand).callsFake(describeCertificateFake);
 
-    const describeCertificateFake = sinon.fake.rejects(error);
-    AWS.mock("ACM", "describeCertificate", describeCertificateFake);
+    const deleteCertificateFake = sinon.fake.resolves({});
+    acmMock.on(acm.DeleteCertificateCommand).callsFake(deleteCertificateFake);
 
-    const deleteCertificateFake = sinon.fake.rejects(error);
-    AWS.mock("ACM", "deleteCertificate", deleteCertificateFake);
+    const listCertificatesFake = sinon.stub();
+    listCertificatesFake.resolves({
+      CertificateSummaryList: [
+        {
+          DomainName: `${testEnvName}.${testAppName}.${testDomainName}`,
+          CertificateArn: testCertificateArn,
+        },
+        {
+          DomainName: `${testEnvName}.${testAppName}.${testDomainName}`,
+          CertificateArn: testOtherCertificateArn,
+        },
+      ],
+    });
+    acmMock.on(acm.ListCertificatesCommand).callsFake(listCertificatesFake);
 
     const request = nock(ResponseURL)
       .put("/", (body) => {
@@ -409,7 +909,278 @@ describe("DNS Validated Certificate Handler", () => {
         RequestId: testRequestId,
         PhysicalResourceId: testCertificateArn,
         ResourceProperties: {
+          AppName: testAppName,
+          EnvName: testEnvName,
+          DomainName: testDomainName,
+          EnvHostedZoneId: testHostedZoneId,
           Region: "us-east-1",
+          RootDNSRole: testRootDNSRole,
+        },
+      })
+      .expectResolve(() => {
+        sinon.assert.calledWith(
+          describeCertificateFake,
+          sinon.match({
+            CertificateArn: testCertificateArn,
+          })
+        );
+        sinon.assert.calledWith(listCertificatesFake, sinon.match({}));
+        sinon.assert.calledWith(
+          describeCertificateFake,
+          sinon.match({
+            CertificateArn: testOtherCertificateArn,
+          })
+        );
+        sinon.assert.calledWith(
+          deleteCertificateFake,
+          sinon.match({
+            CertificateArn: testCertificateArn,
+          })
+        );
+        expect(request.isDone()).toBe(true);
+      });
+  });
+
+  test("Delete operation deletes the cert with record removal", () => {
+    const describeCertificateFake = sinon.stub();
+    describeCertificateFake.onFirstCall().resolves({
+      Certificate: {
+        CertificateArn: testCertificateArn,
+        DomainValidationOptions: newCertValidateOptions,
+      },
+    });
+    describeCertificateFake.onSecondCall().resolves({
+      Certificate: {
+        CertificateArn: testOtherCertificateArn,
+        DomainValidationOptions: newCertValidatorOptionsWithoutV2,
+      },
+    });
+    acmMock.on(acm.DescribeCertificateCommand).callsFake(describeCertificateFake);
+
+    const deleteCertificateFake = sinon.fake.resolves({});
+    acmMock.on(acm.DeleteCertificateCommand).callsFake(deleteCertificateFake);
+
+    const listCertificatesFake = sinon.stub();
+    listCertificatesFake.resolves({
+      CertificateSummaryList: [
+        {
+          DomainName: `${testEnvName}.${testAppName}.${testDomainName}`,
+          CertificateArn: testCertificateArn,
+        },
+        {
+          DomainName: `${testEnvName}.${testAppName}.${testDomainName}`,
+          CertificateArn: testOtherCertificateArn,
+        },
+      ],
+    });
+    acmMock.on(acm.ListCertificatesCommand).callsFake(listCertificatesFake);
+
+    const changeResourceRecordSetsFake = sinon.fake.resolves({
+      ChangeInfo: {
+        Id: "bogus",
+      },
+    });
+    r53Mock.on(r53.ChangeResourceRecordSetsCommand).callsFake(changeResourceRecordSetsFake);
+
+    const listHostedZonesByNameFake = sinon.fake.resolves({
+      HostedZones: [
+        {
+          Id: `/hostedzone/${testAppHostedZoneId}`,
+        },
+      ],
+    });
+    r53Mock.on(r53.ListHostedZonesByNameCommand).callsFake(listHostedZonesByNameFake);
+
+    const request = nock(ResponseURL)
+      .put("/", (body) => {
+        return body.Status === "SUCCESS";
+      })
+      .reply(200);
+
+    return LambdaTester(handler.certificateRequestHandler)
+      .event({
+        RequestType: "Delete",
+        RequestId: testRequestId,
+        PhysicalResourceId: testCertificateArn,
+        ResourceProperties: {
+          AppName: testAppName,
+          EnvName: testEnvName,
+          DomainName: testDomainName,
+          EnvHostedZoneId: testHostedZoneId,
+          Region: "us-east-1",
+          RootDNSRole: testRootDNSRole,
+        },
+      })
+      .expectResolve(() => {
+        sinon.assert.calledWith(
+          describeCertificateFake,
+          sinon.match({
+            CertificateArn: testCertificateArn,
+          })
+        );
+        sinon.assert.calledWith(listCertificatesFake, sinon.match({}));
+        sinon.assert.calledWith(
+          describeCertificateFake,
+          sinon.match({
+            CertificateArn: testOtherCertificateArn,
+          })
+        );
+        sinon.assert.calledWith(
+          changeResourceRecordSetsFake,
+          sinon.match({
+            ChangeBatch: testDeleteRecordChangebatch3,
+            HostedZoneId: testAppHostedZoneId,
+          })
+        );
+        sinon.assert.calledWith(
+          listHostedZonesByNameFake,
+          sinon.match({
+            DNSName: `${testDomainName}`,
+            MaxItems: "1",
+          })
+        );
+        sinon.assert.calledWith(
+          deleteCertificateFake,
+          sinon.match({
+            CertificateArn: testCertificateArn,
+          })
+        );
+        expect(request.isDone()).toBe(true);
+      });
+  });
+
+  test("Delete operation succeeds if the records are already gone", () => {
+    const describeCertificateFake = sinon.stub();
+    describeCertificateFake.onFirstCall().resolves({
+      Certificate: {
+        CertificateArn: testCertificateArn,
+        DomainValidationOptions: newCertValidateOptions,
+      },
+    });
+    describeCertificateFake.onSecondCall().resolves({
+      Certificate: {
+        CertificateArn: testOtherCertificateArn,
+        DomainValidationOptions: newCertValidatorOptionsWithoutV2,
+      },
+    });
+    acmMock.on(acm.DescribeCertificateCommand).callsFake(describeCertificateFake);
+
+    const deleteCertificateFake = sinon.fake.resolves({});
+    acmMock.on(acm.DeleteCertificateCommand).callsFake(deleteCertificateFake);
+
+    const listCertificatesFake = sinon.stub();
+    listCertificatesFake.resolves({
+      CertificateSummaryList: [
+        {
+          DomainName: `${testEnvName}.${testAppName}.${testDomainName}`,
+          CertificateArn: testCertificateArn,
+        },
+        {
+          DomainName: `${testEnvName}.${testAppName}.${testDomainName}`,
+          CertificateArn: testOtherCertificateArn,
+        },
+      ],
+    });
+    acmMock.on(acm.ListCertificatesCommand).callsFake(listCertificatesFake);
+
+    const changeResourceRecordSetsFake = sinon.fake.rejects(new Error("Tried to delete resource record set [name='validate.unused.mockDomain.com', type='CNAME'] but it was not found"));
+    r53Mock.on(r53.ChangeResourceRecordSetsCommand).callsFake(changeResourceRecordSetsFake);
+
+    const listHostedZonesByNameFake = sinon.fake.resolves({
+      HostedZones: [
+        {
+          Id: `/hostedzone/${testAppHostedZoneId}`,
+        },
+      ],
+    });
+    r53Mock.on(r53.ListHostedZonesByNameCommand).callsFake(listHostedZonesByNameFake);
+
+    const request = nock(ResponseURL)
+        .put("/", (body) => {
+          return body.Status === "SUCCESS";
+        })
+        .reply(200);
+
+    return LambdaTester(handler.certificateRequestHandler)
+        .event({
+          RequestType: "Delete",
+          RequestId: testRequestId,
+          PhysicalResourceId: testCertificateArn,
+          ResourceProperties: {
+            AppName: testAppName,
+            EnvName: testEnvName,
+            DomainName: testDomainName,
+            EnvHostedZoneId: testHostedZoneId,
+            Region: "us-east-1",
+            RootDNSRole: testRootDNSRole,
+          },
+        })
+        .expectResolve(() => {
+          sinon.assert.calledWith(
+              describeCertificateFake,
+              sinon.match({
+                CertificateArn: testCertificateArn,
+              })
+          );
+          sinon.assert.calledWith(listCertificatesFake, sinon.match({}));
+          sinon.assert.calledWith(
+              describeCertificateFake,
+              sinon.match({
+                CertificateArn: testOtherCertificateArn,
+              })
+          );
+          sinon.assert.calledWith(
+              changeResourceRecordSetsFake,
+              sinon.match({
+                ChangeBatch: testDeleteRecordChangebatch3,
+                HostedZoneId: testAppHostedZoneId,
+              })
+          );
+          sinon.assert.calledWith(
+              listHostedZonesByNameFake,
+              sinon.match({
+                DNSName: `${testDomainName}`,
+                MaxItems: "1",
+              })
+          );
+          sinon.assert.calledWith(
+              deleteCertificateFake,
+              sinon.match({
+                CertificateArn: testCertificateArn,
+              })
+          );
+          expect(request.isDone()).toBe(true);
+        });
+  });
+
+  test("Delete operation is idempotent", () => {
+    const error = new Error();
+    error.name = "ResourceNotFoundException";
+
+    const describeCertificateFake = sinon.fake.rejects(error);
+    acmMock.on(acm.DescribeCertificateCommand).callsFake(describeCertificateFake);
+
+    const deleteCertificateFake = sinon.fake.rejects(error);
+    acmMock.on(acm.DeleteCertificateCommand).callsFake(deleteCertificateFake);
+
+    const request = nock(ResponseURL)
+      .put("/", (body) => {
+        return body.Status === "SUCCESS";
+      })
+      .reply(200);
+
+    return LambdaTester(handler.certificateRequestHandler)
+      .event({
+        RequestType: "Delete",
+        RequestId: testRequestId,
+        PhysicalResourceId: testCertificateArn,
+        ResourceProperties: {
+          AppName: testAppName,
+          EnvName: testEnvName,
+          DomainName: testDomainName,
+          EnvHostedZoneId: testHostedZoneId,
+          Region: "us-east-1",
+          RootDNSRole: testRootDNSRole,
         },
       })
       .expectResolve(() => {
@@ -438,16 +1209,6 @@ describe("DNS Validated Certificate Handler", () => {
       Certificate: {
         CertificateArn: testCertificateArn,
         InUseBy: [usedByArn],
-        DomainValidationOptions: [
-          {
-            ValidationStatus: "SUCCESS",
-            ResourceRecord: {
-              Name: testRRName,
-              Type: "CNAME",
-              Value: testRRValue,
-            },
-          },
-        ],
       },
     });
 
@@ -455,33 +1216,16 @@ describe("DNS Validated Certificate Handler", () => {
       Certificate: {
         CertificateArn: testCertificateArn,
         InUseBy: [],
-        DomainValidationOptions: [
-          {
-            ValidationStatus: "SUCCESS",
-            ResourceRecord: {
-              Name: testRRName,
-              Type: "CNAME",
-              Value: testRRValue,
-            },
-          },
-        ],
       },
     });
-
-    const changeResourceRecordSetsFake = sinon.fake.resolves({
-      ChangeInfo: {
-        Id: "bogus",
-      },
-    });
-    AWS.mock(
-      "Route53",
-      "changeResourceRecordSets",
-      changeResourceRecordSetsFake
-    );
-    AWS.mock("ACM", "describeCertificate", describeCertificateFake);
+    acmMock.on(acm.DescribeCertificateCommand).callsFake(describeCertificateFake);
 
     const deleteCertificateFake = sinon.fake.resolves({});
-    AWS.mock("ACM", "deleteCertificate", deleteCertificateFake);
+    acmMock.on(acm.DeleteCertificateCommand).callsFake(deleteCertificateFake);
+
+    const listCertificatesFake = sinon.stub();
+    listCertificatesFake.resolves({});
+    acmMock.on(acm.ListCertificatesCommand).callsFake(listCertificatesFake);
 
     const request = nock(ResponseURL)
       .put("/", (body) => {
@@ -495,8 +1239,12 @@ describe("DNS Validated Certificate Handler", () => {
         RequestId: testRequestId,
         PhysicalResourceId: testCertificateArn,
         ResourceProperties: {
-          HostedZoneId: testHostedZoneId,
+          AppName: testAppName,
+          EnvName: testEnvName,
+          DomainName: testDomainName,
+          EnvHostedZoneId: testHostedZoneId,
           Region: "us-east-1",
+          RootDNSRole: testRootDNSRole,
         },
       })
       .expectResolve(() => {
@@ -506,33 +1254,11 @@ describe("DNS Validated Certificate Handler", () => {
             CertificateArn: testCertificateArn,
           })
         );
+        sinon.assert.calledWith(listCertificatesFake, sinon.match({}));
         sinon.assert.calledWith(
           deleteCertificateFake,
           sinon.match({
             CertificateArn: testCertificateArn,
-          })
-        );
-        sinon.assert.calledWith(
-          changeResourceRecordSetsFake,
-          sinon.match({
-            ChangeBatch: {
-              Changes: [
-                {
-                  Action: "DELETE",
-                  ResourceRecordSet: {
-                    Name: testRRName,
-                    Type: "CNAME",
-                    TTL: 60,
-                    ResourceRecords: [
-                      {
-                        Value: testRRValue,
-                      },
-                    ],
-                  },
-                },
-              ],
-            },
-            HostedZoneId: testHostedZoneId,
           })
         );
         expect(request.isDone()).toBe(true);
@@ -549,12 +1275,12 @@ describe("DNS Validated Certificate Handler", () => {
         InUseBy: [usedByArn],
       },
     });
-    AWS.mock("ACM", "describeCertificate", describeCertificateFake);
+    acmMock.on(acm.DescribeCertificateCommand).callsFake(describeCertificateFake);
 
     const error = new Error();
     error.name = "ResourceInUseException";
     const deleteCertificateFake = sinon.fake.rejects(error);
-    AWS.mock("ACM", "deleteCertificate", deleteCertificateFake);
+    acmMock.on(acm.DeleteCertificateCommand).callsFake(deleteCertificateFake);
 
     const request = nock(ResponseURL)
       .put("/", (body) => {
@@ -568,8 +1294,12 @@ describe("DNS Validated Certificate Handler", () => {
         RequestId: testRequestId,
         PhysicalResourceId: testCertificateArn,
         ResourceProperties: {
-          HostedZoneId: testHostedZoneId,
+          AppName: testAppName,
+          EnvName: testEnvName,
+          DomainName: testDomainName,
+          EnvHostedZoneId: testHostedZoneId,
           Region: "us-east-1",
+          RootDNSRole: testRootDNSRole,
         },
       })
       .expectResolve(() => {
@@ -600,10 +1330,10 @@ describe("DNS Validated Certificate Handler", () => {
     error.name = "SomeOtherException";
 
     const describeCertificateFake = sinon.fake.rejects(error);
-    AWS.mock("ACM", "describeCertificate", describeCertificateFake);
+    acmMock.on(acm.DescribeCertificateCommand).callsFake(describeCertificateFake);
 
     const deleteCertificateFake = sinon.fake.resolves({});
-    AWS.mock("ACM", "deleteCertificate", deleteCertificateFake);
+    acmMock.on(acm.DeleteCertificateCommand).callsFake(deleteCertificateFake);
 
     const request = nock(ResponseURL)
       .put("/", (body) => {
@@ -617,8 +1347,12 @@ describe("DNS Validated Certificate Handler", () => {
         RequestId: testRequestId,
         PhysicalResourceId: testCertificateArn,
         ResourceProperties: {
-          HostedZoneId: testHostedZoneId,
+          AppName: testAppName,
+          EnvName: testEnvName,
+          DomainName: testDomainName,
+          EnvHostedZoneId: testHostedZoneId,
           Region: "us-east-1",
+          RootDNSRole: testRootDNSRole,
         },
       })
       .expectResolve(() => {
@@ -644,12 +1378,16 @@ describe("DNS Validated Certificate Handler", () => {
         CertificateArn: testCertificateArn,
       },
     });
-    AWS.mock("ACM", "describeCertificate", describeCertificateFake);
+    acmMock.on(acm.DescribeCertificateCommand).callsFake(describeCertificateFake);
 
     const error = new Error();
     error.name = "SomeOtherException";
     const deleteCertificateFake = sinon.fake.rejects(error);
-    AWS.mock("ACM", "deleteCertificate", deleteCertificateFake);
+    acmMock.on(acm.DeleteCertificateCommand).callsFake(deleteCertificateFake);
+
+    const listCertificatesFake = sinon.stub();
+    listCertificatesFake.resolves({});
+    acmMock.on(acm.ListCertificatesCommand).callsFake(listCertificatesFake);
 
     const request = nock(ResponseURL)
       .put("/", (body) => {
@@ -663,8 +1401,12 @@ describe("DNS Validated Certificate Handler", () => {
         RequestId: testRequestId,
         PhysicalResourceId: testCertificateArn,
         ResourceProperties: {
-          HostedZoneId: testHostedZoneId,
+          AppName: testAppName,
+          EnvName: testEnvName,
+          DomainName: testDomainName,
+          EnvHostedZoneId: testHostedZoneId,
           Region: "us-east-1",
+          RootDNSRole: testRootDNSRole,
         },
       })
       .expectResolve(() => {
@@ -674,6 +1416,7 @@ describe("DNS Validated Certificate Handler", () => {
             CertificateArn: testCertificateArn,
           })
         );
+        sinon.assert.calledWith(listCertificatesFake, sinon.match({}));
         sinon.assert.calledWith(
           deleteCertificateFake,
           sinon.match({
@@ -691,10 +1434,14 @@ describe("DNS Validated Certificate Handler", () => {
         CertificateArn: testCertificateArn,
       },
     });
-    AWS.mock("ACM", "describeCertificate", describeCertificateFake);
+    acmMock.on(acm.DescribeCertificateCommand).callsFake(describeCertificateFake);
 
     const deleteCertificateFake = sinon.fake.resolves({});
-    AWS.mock("ACM", "deleteCertificate", deleteCertificateFake);
+    acmMock.on(acm.DeleteCertificateCommand).callsFake(deleteCertificateFake);
+
+    const listCertificatesFake = sinon.stub();
+    listCertificatesFake.resolves({});
+    acmMock.on(acm.ListCertificatesCommand).callsFake(listCertificatesFake);
 
     const request = nock(ResponseURL)
       .put("/", (body) => {
@@ -708,8 +1455,12 @@ describe("DNS Validated Certificate Handler", () => {
         RequestId: testRequestId,
         PhysicalResourceId: testCertificateArn,
         ResourceProperties: {
-          HostedZoneId: testHostedZoneId,
+          AppName: testAppName,
+          EnvName: testEnvName,
+          DomainName: testDomainName,
+          EnvHostedZoneId: testHostedZoneId,
           Region: "us-east-1",
+          RootDNSRole: testRootDNSRole,
         },
       })
       .expectResolve(() => {
@@ -719,6 +1470,7 @@ describe("DNS Validated Certificate Handler", () => {
             CertificateArn: testCertificateArn,
           })
         );
+        sinon.assert.calledWith(listCertificatesFake, sinon.match({}));
         sinon.assert.calledWith(
           deleteCertificateFake,
           sinon.match({

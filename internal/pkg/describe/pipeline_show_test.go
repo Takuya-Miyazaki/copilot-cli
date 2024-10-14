@@ -9,27 +9,28 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/cloudformation"
 	"github.com/aws/copilot-cli/internal/pkg/aws/codepipeline"
+	"github.com/aws/copilot-cli/internal/pkg/deploy"
 	"github.com/aws/copilot-cli/internal/pkg/describe/mocks"
+	"github.com/aws/copilot-cli/internal/pkg/describe/stack"
 	"github.com/dustin/go-humanize"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 )
 
 type pipelineDescriberMocks struct {
-	stackResourceDescriber *mocks.MockstackResourcesDescriber
-	pipelineGetter         *mocks.MockpipelineGetter
+	cfn            *mocks.MockstackDescriber
+	pipelineGetter *mocks.MockpipelineGetter
 }
 
+var pipelineResourceName = "pipeline-dinder-badgoose-repo-RANDOMSTRING"
 var pipelineName = "pipeline-dinder-badgoose-repo"
 var mockTime = func() time.Time {
 	t, _ := time.Parse(time.RFC3339, "2020-02-02T15:04:05+00:00")
 	return t
 }
 var mockPipeline = &codepipeline.Pipeline{
-	Name:      pipelineName,
+	Name:      pipelineResourceName,
 	Region:    "us-west-2",
 	AccountID: "1234567890",
 	Stages: []*codepipeline.Stage{
@@ -55,7 +56,7 @@ var mockPipeline = &codepipeline.Pipeline{
 	CreatedAt: mockTime(),
 	UpdatedAt: mockTime(),
 }
-var expectedResources = []*CfnResource{
+var expectedResources = []*stack.Resource{
 	{
 		PhysicalID: "pipeline-dinder-badgoose-repo-BuildProject",
 		Type:       "AWS::CodeBuild::Project",
@@ -83,30 +84,30 @@ var expectedResources = []*CfnResource{
 }
 
 func TestPipelineDescriber_Describe(t *testing.T) {
-	mockResources := []*cloudformation.StackResource{
+	mockResources := []*stack.Resource{
 		{
-			PhysicalResourceId: aws.String("pipeline-dinder-badgoose-repo-BuildProject"),
-			ResourceType:       aws.String("AWS::CodeBuild::Project"),
+			PhysicalID: "pipeline-dinder-badgoose-repo-BuildProject",
+			Type:       "AWS::CodeBuild::Project",
 		},
 		{
-			PhysicalResourceId: aws.String("pipel-Buil-1PEASDDL44ID2"),
-			ResourceType:       aws.String("AWS::IAM::Policy"),
+			PhysicalID: "pipel-Buil-1PEASDDL44ID2",
+			Type:       "AWS::IAM::Policy",
 		},
 		{
-			PhysicalResourceId: aws.String("pipeline-dinder-badgoose-repo-BuildProjectRole-A4V6VSG1XIIJ"),
-			ResourceType:       aws.String("AWS::IAM::Role"),
+			PhysicalID: "pipeline-dinder-badgoose-repo-BuildProjectRole-A4V6VSG1XIIJ",
+			Type:       "AWS::IAM::Role",
 		},
 		{
-			PhysicalResourceId: aws.String("pipeline-dinder-badgoose-repo"),
-			ResourceType:       aws.String("AWS::CodePipeline::Pipeline"),
+			PhysicalID: "pipeline-dinder-badgoose-repo",
+			Type:       "AWS::CodePipeline::Pipeline",
 		},
 		{
-			PhysicalResourceId: aws.String("pipeline-dinder-badgoose-repo-PipelineRole-100SEEQN6CU0F"),
-			ResourceType:       aws.String("AWS::IAM::Role"),
+			PhysicalID: "pipeline-dinder-badgoose-repo-PipelineRole-100SEEQN6CU0F",
+			Type:       "AWS::IAM::Role",
 		},
 		{
-			PhysicalResourceId: aws.String("pipel-Pipe-EO4QGE10RJ8F"),
-			ResourceType:       aws.String("AWS::IAM::Policy"),
+			PhysicalID: "pipel-Pipe-EO4QGE10RJ8F",
+			Type:       "AWS::IAM::Policy",
 		},
 	}
 	mockError := errors.New("mockError")
@@ -120,24 +121,32 @@ func TestPipelineDescriber_Describe(t *testing.T) {
 	}{
 		"happy path with resources": {
 			callMocks: func(m pipelineDescriberMocks) {
-				m.pipelineGetter.EXPECT().GetPipeline(pipelineName).Return(mockPipeline, nil)
-				m.stackResourceDescriber.EXPECT().StackResources(pipelineName).Return(mockResources, nil)
+				m.pipelineGetter.EXPECT().GetPipeline(pipelineResourceName).Return(mockPipeline, nil)
+				m.cfn.EXPECT().Resources().Return(mockResources, nil)
 			},
 			inShowResource: true,
 			expectedError:  nil,
-			expectedOutput: &Pipeline{*mockPipeline, expectedResources},
+			expectedOutput: &Pipeline{
+				Name:      pipelineName,
+				Pipeline:  *mockPipeline,
+				Resources: expectedResources,
+			},
 		},
 		"happy path without resources": {
 			callMocks: func(m pipelineDescriberMocks) {
-				m.pipelineGetter.EXPECT().GetPipeline(pipelineName).Return(mockPipeline, nil)
+				m.pipelineGetter.EXPECT().GetPipeline(pipelineResourceName).Return(mockPipeline, nil)
 			},
 			inShowResource: false,
 			expectedError:  nil,
-			expectedOutput: &Pipeline{*mockPipeline, nil},
+			expectedOutput: &Pipeline{
+				Name:      pipelineName,
+				Pipeline:  *mockPipeline,
+				Resources: nil,
+			},
 		},
 		"wraps get pipeline error": {
 			callMocks: func(m pipelineDescriberMocks) {
-				m.pipelineGetter.EXPECT().GetPipeline(pipelineName).Return(nil, mockError)
+				m.pipelineGetter.EXPECT().GetPipeline(pipelineResourceName).Return(nil, mockError)
 			},
 			inShowResource: false,
 			expectedError:  fmt.Errorf("get pipeline: %w", mockError),
@@ -145,8 +154,8 @@ func TestPipelineDescriber_Describe(t *testing.T) {
 		},
 		"wraps stack resources error": {
 			callMocks: func(m pipelineDescriberMocks) {
-				m.pipelineGetter.EXPECT().GetPipeline(pipelineName).Return(mockPipeline, nil)
-				m.stackResourceDescriber.EXPECT().StackResources(pipelineName).Return(nil, mockError)
+				m.pipelineGetter.EXPECT().GetPipeline(pipelineResourceName).Return(mockPipeline, nil)
+				m.cfn.EXPECT().Resources().Return(nil, mockError)
 			},
 			inShowResource: true,
 			expectedError:  fmt.Errorf("retrieve pipeline resources: %w", mockError),
@@ -158,20 +167,27 @@ func TestPipelineDescriber_Describe(t *testing.T) {
 			ctrl := gomock.NewController(t)
 			defer ctrl.Finish()
 
-			mockStackDescriber := mocks.NewMockstackResourcesDescriber(ctrl)
+			mockCFN := mocks.NewMockstackDescriber(ctrl)
 			mockPipelineGetter := mocks.NewMockpipelineGetter(ctrl)
 
 			mocks := pipelineDescriberMocks{
-				stackResourceDescriber: mockStackDescriber,
-				pipelineGetter:         mockPipelineGetter,
+				cfn:            mockCFN,
+				pipelineGetter: mockPipelineGetter,
 			}
 			tc.callMocks(mocks)
 
+			mockDeployedPipeline := deploy.Pipeline{
+				ResourceName: pipelineResourceName,
+				Name:         pipelineName,
+				AppName:      "mockAppName",
+				IsLegacy:     false,
+			}
+
 			describer := &PipelineDescriber{
-				pipelineName:            pipelineName,
-				showResources:           tc.inShowResource,
-				pipelineSvc:             mockPipelineGetter,
-				stackResourcesDescriber: mockStackDescriber,
+				pipeline:      mockDeployedPipeline,
+				showResources: tc.inShowResource,
+				pipelineSvc:   mockPipelineGetter,
+				cfn:           mockCFN,
 			}
 
 			// WHEN
@@ -203,22 +219,26 @@ func TestPipelineDescriber_String(t *testing.T) {
 		expectedJSONString  string
 	}{
 		"correct output with resources": {
-			inPipeline: &Pipeline{*mockPipeline, expectedResources},
+			inPipeline: &Pipeline{
+				Name:      pipelineName,
+				Pipeline:  *mockPipeline,
+				Resources: expectedResources,
+			},
 			expectedHumanString: `About
 
-  Name              pipeline-dinder-badgoose-repo
-  Region            us-west-2
-  AccountID         1234567890
-  Created At        4 months ago
-  Updated At        4 months ago
+  Name        pipeline-dinder-badgoose-repo
+  Region      us-west-2
+  AccountID   1234567890
+  Created At  4 months ago
+  Updated At  4 months ago
 
 Stages
 
-  Name              Category            Provider            Details
-  ----              --------            --------            -------
-  Source            Source              GitHub              Repository: badgoose/repo
-  Build             Build               CodeBuild           BuildProject: pipeline-dinder-badgoose-repo-BuildProject
-  DeployTo-test     Deploy              CloudFormation      StackName: dinder-test-test
+  Name           Category  Provider        Details
+  ----           --------  --------        -------
+  Source         Source    GitHub          Repository: badgoose/repo
+  Build          Build     CodeBuild       BuildProject: pipeline-dinder-badgoose-repo-BuildProject
+  DeployTo-test  Deploy    CloudFormation  StackName: dinder-test-test
 
 Resources
     AWS::CodeBuild::Project      pipeline-dinder-badgoose-repo-BuildProject
@@ -228,27 +248,31 @@ Resources
     AWS::IAM::Role               pipeline-dinder-badgoose-repo-PipelineRole-100SEEQN6CU0F
     AWS::IAM::Policy             pipel-Pipe-EO4QGE10RJ8F
 `,
-			expectedJSONString: "{\"name\":\"pipeline-dinder-badgoose-repo\",\"region\":\"us-west-2\",\"accountId\":\"1234567890\",\"stages\":[{\"name\":\"Source\",\"category\":\"Source\",\"provider\":\"GitHub\",\"details\":\"Repository: badgoose/repo\"},{\"name\":\"Build\",\"category\":\"Build\",\"provider\":\"CodeBuild\",\"details\":\"BuildProject: pipeline-dinder-badgoose-repo-BuildProject\"},{\"name\":\"DeployTo-test\",\"category\":\"Deploy\",\"provider\":\"CloudFormation\",\"details\":\"StackName: dinder-test-test\"}],\"createdAt\":\"2020-02-02T15:04:05Z\",\"updatedAt\":\"2020-02-02T15:04:05Z\",\"resources\":[{\"type\":\"AWS::CodeBuild::Project\",\"physicalID\":\"pipeline-dinder-badgoose-repo-BuildProject\"},{\"type\":\"AWS::IAM::Policy\",\"physicalID\":\"pipel-Buil-1PEASDDL44ID2\"},{\"type\":\"AWS::IAM::Role\",\"physicalID\":\"pipeline-dinder-badgoose-repo-BuildProjectRole-A4V6VSG1XIIJ\"},{\"type\":\"AWS::CodePipeline::Pipeline\",\"physicalID\":\"pipeline-dinder-badgoose-repo\"},{\"type\":\"AWS::IAM::Role\",\"physicalID\":\"pipeline-dinder-badgoose-repo-PipelineRole-100SEEQN6CU0F\"},{\"type\":\"AWS::IAM::Policy\",\"physicalID\":\"pipel-Pipe-EO4QGE10RJ8F\"}]}\n",
+			expectedJSONString: "{\"name\":\"pipeline-dinder-badgoose-repo\",\"pipelineName\":\"pipeline-dinder-badgoose-repo-RANDOMSTRING\",\"region\":\"us-west-2\",\"accountId\":\"1234567890\",\"stages\":[{\"name\":\"Source\",\"category\":\"Source\",\"provider\":\"GitHub\",\"details\":\"Repository: badgoose/repo\"},{\"name\":\"Build\",\"category\":\"Build\",\"provider\":\"CodeBuild\",\"details\":\"BuildProject: pipeline-dinder-badgoose-repo-BuildProject\"},{\"name\":\"DeployTo-test\",\"category\":\"Deploy\",\"provider\":\"CloudFormation\",\"details\":\"StackName: dinder-test-test\"}],\"createdAt\":\"2020-02-02T15:04:05Z\",\"updatedAt\":\"2020-02-02T15:04:05Z\",\"resources\":[{\"type\":\"AWS::CodeBuild::Project\",\"physicalID\":\"pipeline-dinder-badgoose-repo-BuildProject\"},{\"type\":\"AWS::IAM::Policy\",\"physicalID\":\"pipel-Buil-1PEASDDL44ID2\"},{\"type\":\"AWS::IAM::Role\",\"physicalID\":\"pipeline-dinder-badgoose-repo-BuildProjectRole-A4V6VSG1XIIJ\"},{\"type\":\"AWS::CodePipeline::Pipeline\",\"physicalID\":\"pipeline-dinder-badgoose-repo\"},{\"type\":\"AWS::IAM::Role\",\"physicalID\":\"pipeline-dinder-badgoose-repo-PipelineRole-100SEEQN6CU0F\"},{\"type\":\"AWS::IAM::Policy\",\"physicalID\":\"pipel-Pipe-EO4QGE10RJ8F\"}]}\n",
 		},
 		"correct output without resources": {
-			inPipeline: &Pipeline{*mockPipeline, nil},
+			inPipeline: &Pipeline{
+				Name:      pipelineName,
+				Pipeline:  *mockPipeline,
+				Resources: nil,
+			},
 			expectedHumanString: `About
 
-  Name              pipeline-dinder-badgoose-repo
-  Region            us-west-2
-  AccountID         1234567890
-  Created At        4 months ago
-  Updated At        4 months ago
+  Name        pipeline-dinder-badgoose-repo
+  Region      us-west-2
+  AccountID   1234567890
+  Created At  4 months ago
+  Updated At  4 months ago
 
 Stages
 
-  Name              Category            Provider            Details
-  ----              --------            --------            -------
-  Source            Source              GitHub              Repository: badgoose/repo
-  Build             Build               CodeBuild           BuildProject: pipeline-dinder-badgoose-repo-BuildProject
-  DeployTo-test     Deploy              CloudFormation      StackName: dinder-test-test
+  Name           Category  Provider        Details
+  ----           --------  --------        -------
+  Source         Source    GitHub          Repository: badgoose/repo
+  Build          Build     CodeBuild       BuildProject: pipeline-dinder-badgoose-repo-BuildProject
+  DeployTo-test  Deploy    CloudFormation  StackName: dinder-test-test
 `,
-			expectedJSONString: "{\"name\":\"pipeline-dinder-badgoose-repo\",\"region\":\"us-west-2\",\"accountId\":\"1234567890\",\"stages\":[{\"name\":\"Source\",\"category\":\"Source\",\"provider\":\"GitHub\",\"details\":\"Repository: badgoose/repo\"},{\"name\":\"Build\",\"category\":\"Build\",\"provider\":\"CodeBuild\",\"details\":\"BuildProject: pipeline-dinder-badgoose-repo-BuildProject\"},{\"name\":\"DeployTo-test\",\"category\":\"Deploy\",\"provider\":\"CloudFormation\",\"details\":\"StackName: dinder-test-test\"}],\"createdAt\":\"2020-02-02T15:04:05Z\",\"updatedAt\":\"2020-02-02T15:04:05Z\"}\n",
+			expectedJSONString: "{\"name\":\"pipeline-dinder-badgoose-repo\",\"pipelineName\":\"pipeline-dinder-badgoose-repo-RANDOMSTRING\",\"region\":\"us-west-2\",\"accountId\":\"1234567890\",\"stages\":[{\"name\":\"Source\",\"category\":\"Source\",\"provider\":\"GitHub\",\"details\":\"Repository: badgoose/repo\"},{\"name\":\"Build\",\"category\":\"Build\",\"provider\":\"CodeBuild\",\"details\":\"BuildProject: pipeline-dinder-badgoose-repo-BuildProject\"},{\"name\":\"DeployTo-test\",\"category\":\"Deploy\",\"provider\":\"CloudFormation\",\"details\":\"StackName: dinder-test-test\"}],\"createdAt\":\"2020-02-02T15:04:05Z\",\"updatedAt\":\"2020-02-02T15:04:05Z\"}\n",
 		},
 	}
 	for _, tc := range testCases {

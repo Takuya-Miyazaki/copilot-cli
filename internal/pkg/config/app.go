@@ -14,16 +14,13 @@ import (
 
 // Application is a named collection of environments and services.
 type Application struct {
-	Name      string            `json:"name"`           // Name of an Application. Must be unique amongst other apps in the same account.
-	AccountID string            `json:"account"`        // AccountID this app is mastered in.
-	Domain    string            `json:"domain"`         // Existing domain name in Route53. An empty domain name means the user does not have one.
-	Version   string            `json:"version"`        // The version of the app layout in the underlying datastore (e.g. SSM).
-	Tags      map[string]string `json:"tags,omitempty"` // Labels to apply to resources created within the app.
-}
-
-// RequiresDNSDelegation returns true if we have to set up DNS Delegation resources
-func (a *Application) RequiresDNSDelegation() bool {
-	return a.Domain != ""
+	Name                string            `json:"name"`                          // Name of an Application. Must be unique amongst other apps in the same account.
+	AccountID           string            `json:"account"`                       // AccountID this app is mastered in.
+	PermissionsBoundary string            `json:"permissionsBoundary,omitempty"` // Existing IAM permissions boundary.
+	Domain              string            `json:"domain"`                        // Existing domain name in Route53. An empty domain name means the user does not have one.
+	DomainHostedZoneID  string            `json:"domainHostedZoneID"`            // Existing domain hosted zone in Route53. An empty domain name means the user does not have one.
+	Version             string            `json:"version"`                       // The version of the app layout in the underlying datastore (e.g. SSM).
+	Tags                map[string]string `json:"tags,omitempty"`                // Labels to apply to resources created within the app.
 }
 
 // CreateApplication instantiates a new application, validates its uniqueness and stores it in SSM.
@@ -36,11 +33,17 @@ func (s *Store) CreateApplication(application *Application) error {
 		return fmt.Errorf("serializing application %s: %w", application.Name, err)
 	}
 
-	_, err = s.ssmClient.PutParameter(&ssm.PutParameterInput{
+	_, err = s.ssm.PutParameter(&ssm.PutParameterInput{
 		Name:        aws.String(applicationPath),
 		Description: aws.String("Copilot Application"),
 		Type:        aws.String(ssm.ParameterTypeString),
 		Value:       aws.String(data),
+		Tags: []*ssm.Tag{
+			{
+				Key:   aws.String("copilot-application"),
+				Value: aws.String(application.Name),
+			},
+		},
 	})
 
 	if err != nil {
@@ -55,10 +58,32 @@ func (s *Store) CreateApplication(application *Application) error {
 	return nil
 }
 
+// UpdateApplication updates the data in SSM about an application.
+func (s *Store) UpdateApplication(application *Application) error {
+	applicationPath := fmt.Sprintf(fmtApplicationPath, application.Name)
+	application.Version = schemaVersion
+
+	data, err := marshal(application)
+	if err != nil {
+		return fmt.Errorf("serializing application %s: %w", application.Name, err)
+	}
+
+	if _, err = s.ssm.PutParameter(&ssm.PutParameterInput{
+		Name:        aws.String(applicationPath),
+		Description: aws.String("Copilot Application"),
+		Type:        aws.String(ssm.ParameterTypeString),
+		Value:       aws.String(data),
+		Overwrite:   aws.Bool(true),
+	}); err != nil {
+		return fmt.Errorf("update application %s: %w", application.Name, err)
+	}
+	return nil
+}
+
 // GetApplication fetches an application by name. If it can't be found, return a ErrNoSuchApplication
 func (s *Store) GetApplication(applicationName string) (*Application, error) {
 	applicationPath := fmt.Sprintf(fmtApplicationPath, applicationName)
-	applicationParam, err := s.ssmClient.GetParameter(&ssm.GetParameterInput{
+	applicationParam, err := s.ssm.GetParameter(&ssm.GetParameterInput{
 		Name: aws.String(applicationPath),
 	})
 
@@ -106,7 +131,7 @@ func (s *Store) ListApplications() ([]*Application, error) {
 func (s *Store) DeleteApplication(name string) error {
 	paramName := fmt.Sprintf(fmtApplicationPath, name)
 
-	_, err := s.ssmClient.DeleteParameter(&ssm.DeleteParameterInput{
+	_, err := s.ssm.DeleteParameter(&ssm.DeleteParameterInput{
 		Name: aws.String(paramName),
 	})
 

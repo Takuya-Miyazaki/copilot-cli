@@ -4,15 +4,30 @@
 package template
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strconv"
 	"strings"
+
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
+
+	"github.com/aws/aws-sdk-go/aws/arn"
+
+	"github.com/aws/aws-sdk-go/aws"
 )
 
 const (
 	dashReplacement = "DASH"
+	plusReplacement = "%2B"
 )
+
+// URLSafeVersion takes a Copilot version and replaces the '+'
+// character with the URL-safe '%2B'.
+func URLSafeVersion(version string) string {
+	return strings.ReplaceAll(version, "+", plusReplacement)
+}
 
 // ReplaceDashesFunc takes a CloudFormation logical ID, and
 // sanitizes it by removing "-" characters (not allowed)
@@ -20,6 +35,16 @@ const (
 // not permitted in ecs-cli generated resource names).
 func ReplaceDashesFunc(logicalID string) string {
 	return strings.ReplaceAll(logicalID, "-", dashReplacement)
+}
+
+// IsARNFunc takes a string value and determines if it's an ARN or not.
+func IsARNFunc(value string) bool {
+	return arn.IsARN(value)
+}
+
+// TrimSlashPrefix takes a string value and removes slash prefix from the string if present.
+func TrimSlashPrefix(value string) string {
+	return strings.TrimPrefix(value, "/")
 }
 
 // DashReplacedLogicalIDToOriginal takes a "sanitized" logical ID
@@ -39,6 +64,22 @@ func StripNonAlphaNumFunc(s string) string {
 // "Name" to the end.
 func EnvVarNameFunc(s string) string {
 	return StripNonAlphaNumFunc(s) + "Name"
+}
+
+// HasCustomIngress returns true if there is any ingress specified by the customer.
+func (cfg *PublicHTTPConfig) HasCustomIngress() bool {
+	return len(cfg.PublicALBSourceIPs) > 0 || len(cfg.CIDRPrefixListIDs) > 0
+}
+
+// IsFIFO checks if the given queue has FIFO config.
+func (s SQSQueue) IsFIFO() bool {
+	return s.FIFOQueueConfig != nil
+}
+
+// EnvVarSecretFunc converts an input resource name to LogicalIDSafe, then appends
+// "Secret" to the end.
+func EnvVarSecretFunc(s string) string {
+	return StripNonAlphaNumFunc(s) + "Secret"
 }
 
 // Grabs word boundaries in default CamelCase. Matches lowercase letters & numbers
@@ -70,27 +111,104 @@ func FmtSliceFunc(elems []string) string {
 
 // QuoteSliceFunc places quotation marks around all elements of a go string slice.
 func QuoteSliceFunc(elems []string) []string {
-	var quotedElems []string
 	if len(elems) == 0 {
-		return quotedElems
+		return nil
 	}
-	quotedElems = make([]string, len(elems))
+	quotedElems := make([]string, len(elems))
 	for i, el := range elems {
 		quotedElems[i] = strconv.Quote(el)
 	}
 	return quotedElems
 }
 
-// QuotePSliceFunc places quotation marks around all
-// dereferenced elements of elems and returns a []string slice.
-func QuotePSliceFunc(elems []*string) []string {
-	var quotedElems []string
-	if len(elems) == 0 {
-		return quotedElems
+// generateMountPointJSON turns a list of MountPoint objects into a JSON string:
+// `{"myEFSVolume": "/var/www", "myEBSVolume": "/usr/data"}`
+// This function must be called on an array of correctly constructed MountPoint objects.
+func generateMountPointJSON(mountPoints []*MountPoint) string {
+	volumeMap := make(map[string]string)
+
+	for _, mp := range mountPoints {
+		// Skip adding mount points with empty container paths to the map.
+		// This is validated elsewhere so this condition should never happen, but it
+		// will fail to inject mountpoints with empty paths.
+		if aws.StringValue(mp.ContainerPath) == "" {
+			continue
+		}
+		volumeMap[aws.StringValue(mp.SourceVolume)] = aws.StringValue(mp.ContainerPath)
 	}
-	quotedElems = make([]string, len(elems))
-	for i, el := range elems {
-		quotedElems[i] = strconv.Quote(*el)
+
+	out, ok := getJSONMap(volumeMap)
+	if !ok {
+		return "{}"
 	}
-	return quotedElems
+
+	return string(out)
+
+}
+
+// generatePublisherJSON turns a list of Topics objects into a JSON string:
+// `{"myTopic": "topicArn", "mySecondTopic": "secondTopicArn"}`
+// This function must be called on an array of correctly constructed Topic objects.
+func generateSNSJSON(topics []*Topic) string {
+	if topics == nil {
+		return ""
+	}
+	topicMap := make(map[string]string)
+
+	for _, topic := range topics {
+		// Topics with no name will not be included in the json
+		if topic.Name == nil {
+			continue
+		}
+		topicMap[aws.StringValue(topic.Name)] = topic.ARN()
+	}
+
+	out, ok := getJSONMap(topicMap)
+	if !ok {
+		return "{}"
+	}
+
+	return string(out)
+}
+
+// generateQueueURIJSON turns a list of Topic Subscription objects into a JSON string of their corresponding queues:
+// `{"svcTopicEventsQueue": "${svctopicURL}"}`
+// This function must be called on an array of correctly constructed Topic objects.
+func generateQueueURIJSON(ts []*TopicSubscription) string {
+	if ts == nil {
+		return ""
+	}
+	urlMap := make(map[string]string)
+	for _, sub := range ts {
+		// TopicSubscriptions with no name, service, or queue will not be included in the json
+		if sub.Name == nil || sub.Service == nil || sub.Queue == nil {
+			continue
+		}
+		svc := StripNonAlphaNumFunc(aws.StringValue(sub.Service))
+		topicName := StripNonAlphaNumFunc(aws.StringValue(sub.Name))
+		subName := fmt.Sprintf("%s%sEventsQueue", svc, cases.Title(language.English).String(topicName))
+
+		urlMap[subName] = fmt.Sprintf("${%s%sURL}", svc, topicName)
+	}
+
+	out, ok := getJSONMap(urlMap)
+	if !ok {
+		return "{}"
+	}
+
+	return string(out)
+}
+
+func getJSONMap(inMap map[string]string) ([]byte, bool) {
+	// Check for empty maps
+	if len(inMap) == 0 {
+		return nil, false
+	}
+
+	out, err := json.Marshal(inMap)
+	if err != nil {
+		return nil, false
+	}
+
+	return out, true
 }

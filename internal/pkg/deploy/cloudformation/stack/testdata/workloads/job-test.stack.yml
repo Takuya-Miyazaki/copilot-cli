@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 AWSTemplateFormatVersion: 2010-09-09
 Description: CloudFormation template that represents a scheduled job on Amazon ECS. 
+Metadata:
+  Version: v1.29.0
 Parameters: 
   AppName:
     Type: String
@@ -25,9 +27,24 @@ Parameters:
     Description: 'URL of the addons nested stack template within the S3 bucket.'
     Type: String
     Default: ""
+  EnvFileARN:
+    Description: 'URL of the environment file.'
+    Type: String
+    Default: ""
+  ArtifactKeyARN:
+    Type: String
+    Description: 'KMS Key used for encrypting artifacts'
+  EnvFileARNFornginx:
+    Description: 'URL of the environment file for the nginx sidecar.'
+    Type: String
+    Default: ""
 Conditions: 
   HasAddons: # If a bucket URL is specified, that means the template exists.
     !Not [!Equals [!Ref AddonsTemplateURL, ""]]
+  HasEnvFile:
+    !Not [!Equals [!Ref EnvFileARN, ""]]
+  HasEnvFileFornginx:
+    !Not [!Equals [!Ref EnvFileARNFornginx, ""]]
 Resources: 
   LogGroup:
     Metadata:
@@ -36,6 +53,72 @@ Resources:
     Properties:
       LogGroupName: !Join ['', [/copilot/, !Ref AppName, '-', !Ref EnvName, '-', !Ref WorkloadName]]
       RetentionInDays: !Ref LogRetention
+
+  EnvControllerAction:
+    Metadata:
+      'aws:copilot:description': "Update your environment's shared resources"
+    Type: Custom::EnvControllerFunction
+    Properties:
+      ServiceToken: !GetAtt EnvControllerFunction.Arn
+      Workload: !Ref WorkloadName
+      EnvStack: !Sub '${AppName}-${EnvName}'
+      Parameters:
+      - EFSWorkloads
+      EnvVersion: v1.42.0
+
+  EnvControllerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: "index.handler"
+      Timeout: 900
+      MemorySize: 512
+      Role: !GetAtt 'EnvControllerRole.Arn'
+      Runtime: nodejs20.x
+
+  EnvControllerRole:
+    Metadata:
+      'aws:copilot:description': "An IAM role to update your environment stack"
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: "EnvControllerStackUpdate"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+                - cloudformation:DescribeStacks
+                - cloudformation:UpdateStack
+              Resource:  !Sub 'arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AppName}-${EnvName}/*'
+              Condition:
+                StringEquals:
+                  'cloudformation:ResourceTag/copilot-application': !Sub '${AppName}'
+                  'cloudformation:ResourceTag/copilot-environment': !Sub '${EnvName}'
+        - PolicyName: "EnvControllerRolePass"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+                - iam:PassRole
+              Resource:  !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AppName}-${EnvName}-CFNExecutionRole'
+              Condition:
+                StringEquals:
+                  'iam:ResourceTag/copilot-application': !Sub '${AppName}'
+                  'iam:ResourceTag/copilot-environment': !Sub '${EnvName}'
+      ManagedPolicyArns:
+        - arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 
   TaskDefinition:
     Metadata:
@@ -49,11 +132,21 @@ Resources:
         - FARGATE
       Cpu: !Ref TaskCPU
       Memory: !Ref TaskMemory
-      ExecutionRoleArn: !Ref ExecutionRole
-      TaskRoleArn: !Ref TaskRole
+      EphemeralStorage:
+        SizeInGiB: 200
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
       ContainerDefinitions:
         - Name: !Ref WorkloadName
           Image: !Ref ContainerImage
+          Secrets:
+            - Name: DB
+              ValueFrom: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:demo/test/mysql'
+            - Name: GIT_USERNAME
+              ValueFrom:
+                Fn::ImportValue: "stack-SSMGHUserName"
+            - Name: SQL_PASS
+              ValueFrom: SQL_PASS
           # We pipe certain environment variables directly into the task definition.
           # This lets customers have access to, for example, their LB endpoint - which they'd
           # have no way of otherwise determining.
@@ -61,19 +154,98 @@ Resources:
           - Name: COPILOT_APPLICATION_NAME
             Value: !Sub '${AppName}'
           - Name: COPILOT_SERVICE_DISCOVERY_ENDPOINT
-            Value: !Sub '${AppName}.local'
+            Value: test.my-app.local
           - Name: COPILOT_ENVIRONMENT_NAME
             Value: !Sub '${EnvName}'
           - Name: COPILOT_SERVICE_NAME
             Value: !Sub '${WorkloadName}'
-          
+          - Name: COPILOT_SNS_TOPIC_ARNS
+            Value: '{"mytopic.fifo":"arn:aws:sns:us-west-2:123456789123:my-app-test-job-mytopic.fifo"}'
+          - Name: DB_NAME
+            Value:
+              Fn::ImportValue: "MYDB"
+          - Name: COPILOT_MOUNT_POINTS
+            Value: '{"managedEFSVolume":"/etc/mount1"}'
+
+          EnvironmentFiles:
+          - !If
+            - HasEnvFile
+            - Type: s3
+              Value: !Ref EnvFileARN
+            - !Ref AWS::NoValue
           LogConfiguration:
             LogDriver: awslogs
             Options:
               awslogs-region: !Ref AWS::Region
               awslogs-group: !Ref LogGroup
               awslogs-stream-prefix: copilot
-        
+          MountPoints:
+            - ContainerPath: /etc/mount1
+              ReadOnly: false
+              SourceVolume: managedEFSVolume
+          DockerLabels:
+            com.amazonaws.ecs.copilot.coollabel: Synecdoche
+            com.amazonaws.ecs.copilot.description: Hello world!
+          DependsOn:
+            - Condition: START
+              ContainerName: nginx
+        - Name: nginx
+          Image: 'public.ecr.aws/nginx/nginx'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: copilot
+          MountPoints:
+            - ContainerPath: '/var/www'
+              ReadOnly: true
+              SourceVolume: managedEFSVolume
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          Environment:
+            - Name: COPILOT_APPLICATION_NAME
+              Value: !Sub '${AppName}'
+            - Name: COPILOT_SERVICE_DISCOVERY_ENDPOINT
+              Value: test.my-app.local
+            - Name: COPILOT_ENVIRONMENT_NAME
+              Value: !Sub '${EnvName}'
+            - Name: COPILOT_SERVICE_NAME
+              Value: !Sub '${WorkloadName}'
+            - Name: COPILOT_SNS_TOPIC_ARNS
+              Value: '{"mytopic.fifo":"arn:aws:sns:us-west-2:123456789123:my-app-test-job-mytopic.fifo"}'
+            - Name: NGINX_PORT
+              Value: '8080'
+            - Name: COPILOT_MOUNT_POINTS
+              Value: '{"managedEFSVolume":"/var/www"}'
+          EnvironmentFiles:
+          - !If
+            - HasEnvFileFornginx
+            - Type: s3
+              Value: !Ref EnvFileARNFornginx
+            - !Ref AWS::NoValue
+          Secrets:
+            - Name: DB
+              ValueFrom: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:demo/testing/mysql'
+            - Name: GIT_USERNAME
+              ValueFrom:
+                Fn::ImportValue: "stack-SSMGHUserName"
+            - Name: SQL_PASS
+              ValueFrom: SQL_PASS
+          Essential: true
+          DockerLabels:
+            com.amazonaws.ecs.copilot.sidecars.nginx.description: tricky
+
+      Volumes:
+        - Name: managedEFSVolume
+          EFSVolumeConfiguration:
+            FilesystemId: !GetAtt EnvControllerAction.ManagedFileSystemID
+            RootDirectory: /
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              IAM: ENABLED
+              AccessPointId: !Ref AccessPoint
         
   ExecutionRole:
     Metadata:
@@ -81,6 +253,7 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
@@ -95,7 +268,7 @@ Resources:
                 Action:
                   - 'ssm:GetParameters'
                 Resource:
-                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*'
+                  - !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*'
                 Condition:
                   StringEquals:
                     'ssm:ResourceTag/copilot-application': !Sub '${AppName}'
@@ -104,7 +277,7 @@ Resources:
                 Action:
                   - 'secretsmanager:GetSecretValue'
                 Resource:
-                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*'
+                  - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*'
                 Condition:
                   StringEquals:
                     'secretsmanager:ResourceTag/copilot-application': !Sub '${AppName}'
@@ -113,9 +286,63 @@ Resources:
                 Action:
                   - 'kms:Decrypt'
                 Resource:
-                  - !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                  - !Ref ArtifactKeyARN
+              - Sid: DecryptTaggedKMSKey
+                Effect: 'Allow'
+                Action:
+                  - 'kms:Decrypt'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition:
+                  StringEquals:
+                    'aws:ResourceTag/copilot-application': !Sub '${AppName}'
+                    'aws:ResourceTag/copilot-environment': !Sub '${EnvName}'
+        - !If
+          - HasEnvFile
+          - PolicyName: !Join ['', [!Ref AppName, '-', !Ref EnvName, '-', !Ref WorkloadName, GetEnvFilePolicy]]
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: 'Allow'
+                  Action:
+                    - 's3:GetObject'
+                  Resource:
+                    - !Ref EnvFileARN
+                - Effect: 'Allow'
+                  Action:
+                    - 's3:GetBucketLocation'
+                  Resource:
+                    - !Join
+                      - ''
+                      - - 'arn:'
+                        - !Ref AWS::Partition
+                        - ':s3:::'
+                        - !Select [0, !Split ['/', !Select [5, !Split [':', !Ref EnvFileARN]]]]
+          - !Ref AWS::NoValue
+        - !If
+          - HasEnvFileFornginx
+          - PolicyName: !Join ['', [!Ref AppName, '-', !Ref EnvName, '-', !Ref WorkloadName, GetEnvFilePolicyFornginx]]
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: 'Allow'
+                  Action:
+                    - 's3:GetObject'
+                  Resource:
+                    - !Ref EnvFileARNFornginx
+                - Effect: 'Allow'
+                  Action:
+                    - 's3:GetBucketLocation'
+                  Resource:
+                    - !Join
+                      - ''
+                      - - 'arn:'
+                        - !Ref AWS::Partition
+                        - ':s3:::'
+                        - !Select [0, !Split ['/', !Select [5, !Split [':', !Ref EnvFileARNFornginx]]]]
+          - !Ref AWS::NoValue
       ManagedPolicyArns:
-        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+        - 'arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
   
 
   TaskRole:
@@ -124,28 +351,46 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
               Service: ecs-tasks.amazonaws.com
             Action: 'sts:AssumeRole'
       Policies:
-        - PolicyName: 'DenyIAMExceptTaggedRoles'
+        - PolicyName: 'DenyIAM'
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: 'Deny'
                 Action: 'iam:*'
                 Resource: '*'
+        - PolicyName: 'GrantAccessCopilotManagedEFS'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
               - Effect: 'Allow'
-                Action: 'sts:AssumeRole'
-                Resource:
-                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/*'
+                Action:
+                  - 'elasticfilesystem:ClientMount'
+                  - 'elasticfilesystem:ClientWrite'
                 Condition:
                   StringEquals:
-                    'iam:ResourceTag/copilot-application': !Sub '${AppName}'
-                    'iam:ResourceTag/copilot-environment': !Sub '${EnvName}'
-  
+                    'elasticfilesystem:AccessPointArn': !GetAtt AccessPoint.Arn
+                Resource: 
+                  - Fn::Sub:
+                    - 'arn:${partition}:elasticfilesystem:${region}:${account}:file-system/${fsid}'
+                    - partition: !Ref AWS::Partition
+                      region: !Ref AWS::Region
+                      account: !Ref AWS::AccountId
+                      fsid: !GetAtt EnvControllerAction.ManagedFileSystemID
+        - PolicyName: 'Publish2SNS'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action: 'sns:Publish'
+                Resource:
+                  - !Ref mytopicfifoSNSTopic
 
   Rule:
     Metadata:
@@ -162,6 +407,7 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
+        Version: '2012-10-17'
         Statement:
         - Effect: Allow
           Principal:
@@ -170,6 +416,7 @@ Resources:
       Policies:
       - PolicyName: EventRulePolicy
         PolicyDocument:
+          Version: '2012-10-17'
           Statement:
           - Effect: Allow
             Action: states:StartExecution
@@ -194,23 +441,21 @@ Resources:
           Fn::ImportValue:
             !Sub '${AppName}-${EnvName}-ClusterId'
         TaskDefinition: !Ref TaskDefinition
+        Partition: !Ref AWS::Partition
         Subnets:
           Fn::Join:
             - '","'
-            - - Fn::Select:
-                - 0
-                - Fn::Split:
-                  - ','
-                  - Fn::ImportValue: !Sub '${AppName}-${EnvName}-PublicSubnets'
-              - Fn::Select:
-                - 1
-                - Fn::Split:
-                  - ','
-                  - Fn::ImportValue: !Sub '${AppName}-${EnvName}-PublicSubnets'
+            - Fn::Split:
+              - ','
+              - Fn::ImportValue: !Sub '${AppName}-${EnvName}-PublicSubnets'
         AssignPublicIp: ENABLED # Should be DISABLED if we use private subnets
         SecurityGroups:
-          Fn::ImportValue:
-            !Sub "${AppName}-${EnvName}-EnvironmentSecurityGroup"
+          Fn::Join:
+          - '","'
+          - - sg-0c10c4fe23f5e5361
+            - sg-09295097b2a41b59d
+            - Fn::ImportValue: MyUserDBAccessSecurityGroup1
+            - Fn::ImportValue: MyUserDBAccessSecurityGroup2
       DefinitionString: |-
         {
           "Version": "1.0",
@@ -220,7 +465,7 @@ Resources:
           "States": {
             "Run Fargate Task": {
               "Type": "Task",
-              "Resource": "arn:aws:states:::ecs:runTask.sync",
+              "Resource": "arn:${Partition}:states:::ecs:runTask.sync",
               "Parameters": {
                 "LaunchType": "FARGATE",
                 "PlatformVersion": "LATEST",
@@ -252,10 +497,12 @@ Resources:
         }      
         
   StateMachineRole:
+    Metadata:
+      'aws:copilot:description': 'An IAM role for a state machine to run ECS tasks in your cluster'
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
-        Version: 2012-10-17
+        Version: '2012-10-17'
         Statement:
         - Effect: Allow
           Principal:
@@ -264,6 +511,7 @@ Resources:
       Policies:
       - PolicyName: StateMachine
         PolicyDocument:
+          Version: '2012-10-17'
           Statement:
           - Effect: Allow
             Action: iam:PassRole
@@ -312,11 +560,29 @@ Resources:
             - events:DescribeRule
             Resource: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForECSTaskRule
   
+  AccessPoint:
+    Metadata:
+      'aws:copilot:description': 'An EFS access point to handle POSIX permissions'
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      ClientToken: !Sub ${AppName}-${EnvName}-${WorkloadName}
+      FileSystemId: !GetAtt EnvControllerAction.ManagedFileSystemID
+      PosixUser: 
+        Uid: 4225294584
+        Gid: 4225294584
+      RootDirectory: 
+        Path: '/job'
+        CreationInfo:
+          OwnerUid: 4225294584
+          OwnerGid: 4225294584
+          Permissions: '0755'
+
 
   AddonsStack:
     Metadata:
       'aws:copilot:description': 'An Addons CloudFormation Stack for your additional AWS resources'
     Type: AWS::CloudFormation::Stack
+    DependsOn: EnvControllerAction
     Condition: HasAddons
     Properties:
       Parameters:
@@ -325,3 +591,30 @@ Resources:
         Name: !Ref WorkloadName
       TemplateURL:
         !Ref AddonsTemplateURL
+
+  mytopicfifoSNSTopic:
+    Metadata:
+      'aws:copilot:description': 'A SNS FIFO topic to broadcast mytopic.fifo events'
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-mytopic.fifo'
+      FifoTopic: true
+      KmsMasterKeyId: 'alias/aws/sns'
+  mytopicfifoSNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    DependsOn: mytopicfifoSNSTopic
+    Properties:
+      Topics:
+        - !Ref mytopicfifoSNSTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action:
+              - sns:Subscribe
+            Resource: !Ref mytopicfifoSNSTopic
+            Condition:
+              StringEquals:
+                "sns:Protocol": "sqs"

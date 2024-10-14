@@ -7,8 +7,23 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"os"
+	"path"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+
+	"github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation/stack"
+
+	"github.com/aws/aws-sdk-go/service/ssm"
+	"github.com/aws/copilot-cli/internal/pkg/aws/identity"
+	rg "github.com/aws/copilot-cli/internal/pkg/aws/resourcegroups"
+	"github.com/dustin/go-humanize/english"
+
+	"github.com/aws/copilot-cli/internal/pkg/deploy"
+
+	"github.com/aws/copilot-cli/internal/pkg/exec"
 
 	"github.com/aws/aws-sdk-go/aws"
 
@@ -27,78 +42,173 @@ import (
 	"github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation"
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
 	"github.com/aws/copilot-cli/internal/pkg/template"
-	"github.com/aws/copilot-cli/internal/pkg/term/command"
 	"github.com/aws/copilot-cli/internal/pkg/term/prompt"
 	"github.com/aws/copilot-cli/internal/pkg/workspace"
 	"github.com/spf13/afero"
 )
 
 const (
+	fmtPipelineInitNamePrompt  = "What would you like to %s this pipeline?"
+	pipelineInitNameHelpPrompt = `A unique identifier for your pipeline (e.g., "myRepo-myBranch").`
+
 	pipelineSelectEnvPrompt     = "Which environment would you like to add to your pipeline?"
 	pipelineSelectEnvHelpPrompt = "Adds an environment that corresponds to a deployment stage in your pipeline. Environments are added sequentially."
 
 	pipelineSelectURLPrompt     = "Which repository would you like to use for your pipeline?"
 	pipelineSelectURLHelpPrompt = `The repository linked to your pipeline.
 Pushing to this repository will trigger your pipeline build stage.
-Please enter full repository URL, e.g. "https://github.com/myCompany/myRepo", or the owner/rep, e.g. "myCompany/myRepo"`
+Please enter full repository URL, e.g., "https://github.com/myCompany/myRepo", or the owner/rep, e.g., "myCompany/myRepo"`
 )
 
 const (
-	buildspecTemplatePath = "cicd/buildspec.yml"
-	githubURL             = "github.com"
-	ccIdentifier          = "codecommit"
-	awsURL                = "aws.amazon.com"
-	ghProviderName        = "GitHub"
-	ccProviderName        = "CodeCommit"
-	defaultGHBranch       = "main"
-	defaultCCBranch       = "master"
+	workloadsPipelineBuildspecTemplatePath    = "cicd/buildspec.yml"
+	environmentsPipelineBuildspecTemplatePath = "cicd/env/buildspec.yml"
+
+	fmtPipelineStackName = "pipeline-%s-%s" // Ex: "pipeline-appName-repoName"
+	defaultBranch        = deploy.DefaultPipelineBranch
+	// For a GitHub repository.
+	githubURL     = "github.com"
+	fmtGHRepoURL  = "https://%s/%s/%s"   // Ex: "https://github.com/repoOwner/repoName"
+	fmtSecretName = "github-token-%s-%s" // Ex: "github-token-appName-repoName"
+	// For a CodeCommit repository.
+	awsURL       = "aws.amazon.com"
+	ccIdentifier = "codecommit"
+	fmtCCRepoURL = "https://%s.console.%s/codesuite/codecommit/repositories/%s/browse" // Ex: "https://region.console.aws.amazon.com/codesuite/codecommit/repositories/repoName/browse"
+	// For a Bitbucket repository.
+	bbURL        = "bitbucket.org"
+	fmtBBRepoURL = "https://%s/%s/%s" // Ex: "https://bitbucket.org/repoOwner/repoName"
 )
 
 const (
-	fmtSecretName     = "github-token-%s-%s"
-	fmtGHPipelineName = "pipeline-%s-%s-%s"
-	fmtCCPipelineName = "pipeline-%s-%s"
-	fmtGHRepoURL      = "https://%s/%s/%s"
-	fmtCCRepoURL      = "https://%s.console.%s/codesuite/codecommit/repositories/%s/browse"
+	pipelineTypeWorkloads    = "Workloads"
+	pipelineTypeEnvironments = "Environments"
 )
+
+var pipelineTypes = []string{pipelineTypeWorkloads, pipelineTypeEnvironments}
+
+var buildspecTemplateFunctions = map[string]interface{}{
+	"URLSafeVersion": template.URLSafeVersion,
+}
 
 var (
 	// Filled in via the -ldflags flag at compile time to support pipeline buildspec CLI pulling.
 	binaryS3BucketPath string
 )
 
+// Pipeline init errors.
+var (
+	fmtErrInvalidPipelineProvider = "repository %s must be from a supported provider: %s"
+)
+
+type pipelineInitializer interface {
+	writeManifest() error
+	writeBuildspec() error
+}
+
+type workloadPipelineInitializer struct {
+	cmd *initPipelineOpts
+}
+
+type envPipelineInitializer struct {
+	cmd *initPipelineOpts
+}
+
+func (ini *workloadPipelineInitializer) writeManifest() error {
+	var stages []manifest.PipelineStage
+	for _, env := range ini.cmd.envConfigs {
+		stage := manifest.PipelineStage{
+			Name: env.Name,
+		}
+		stages = append(stages, stage)
+	}
+	return ini.cmd.createPipelineManifest(stages)
+}
+
+func (ini *workloadPipelineInitializer) writeBuildspec() error {
+	if err := ini.cmd.createBuildspec(workloadsPipelineBuildspecTemplatePath); err != nil {
+		return err
+	}
+	log.Debugln(`The buildspec contains the commands to push your container images, and generate CloudFormation templates.
+Update the "build" phase to unit test your services before pushing the images.`)
+	return nil
+}
+
+func (ini *envPipelineInitializer) writeManifest() error {
+	var stages []manifest.PipelineStage
+	for _, env := range ini.cmd.envConfigs {
+		stage := manifest.PipelineStage{
+			Name: env.Name,
+			Deployments: manifest.Deployments{
+				"deploy-env": &manifest.Deployment{
+					TemplatePath:   path.Join(deploy.DefaultPipelineArtifactsDir, fmt.Sprintf(envCFNTemplateNameFmt, env.Name)),
+					TemplateConfig: path.Join(deploy.DefaultPipelineArtifactsDir, fmt.Sprintf(envCFNTemplateConfigurationNameFmt, env.Name)),
+					StackName:      stack.NameForEnv(ini.cmd.appName, env.Name),
+				},
+			},
+		}
+		stages = append(stages, stage)
+	}
+	return ini.cmd.createPipelineManifest(stages)
+}
+
+func (ini *envPipelineInitializer) writeBuildspec() error {
+	if err := ini.cmd.createBuildspec(environmentsPipelineBuildspecTemplatePath); err != nil {
+		return err
+	}
+	log.Debugln(`The buildspec contains the commands to generate CloudFormation templates for your environments.`)
+	return nil
+}
+
+func newPipelineInitializer(cmd *initPipelineOpts) pipelineInitializer {
+	switch cmd.pipelineType {
+	case pipelineTypeWorkloads:
+		return &workloadPipelineInitializer{
+			cmd: cmd,
+		}
+	case pipelineTypeEnvironments:
+		return &envPipelineInitializer{
+			cmd: cmd,
+		}
+	}
+	return nil
+}
+
 type initPipelineVars struct {
 	appName           string
+	name              string // Name of the pipeline
 	environments      []string
 	repoURL           string
 	repoBranch        string
 	githubAccessToken string
+	pipelineType      string
 }
 
 type initPipelineOpts struct {
 	initPipelineVars
 	// Interfaces to interact with dependencies.
-	workspace      wsPipelineWriter
+	workspace      wsPipelineIniter
 	secretsmanager secretsManager
 	parser         template.Parser
-	runner         runner
+	runner         execRunner
 	sessProvider   sessionProvider
 	cfnClient      appResourcesGetter
 	store          store
 	prompt         prompter
-	sel            pipelineSelector
+	sel            pipelineEnvSelector
+	pipelineLister deployedPipelineLister
 
 	// Outputs stored on successful actions.
-	secret      string
-	provider    string
-	repoName    string
-	githubOwner string
-	ccRegion    string
+	secret    string
+	provider  string
+	repoName  string
+	repoOwner string
+	ccRegion  string
 
-	// Caches variables
-	fs         *afero.Afero
-	buffer     bytes.Buffer
-	envConfigs []*config.Environment
+	// Cached variables
+	wsAppName    string
+	buffer       bytes.Buffer
+	envConfigs   []*config.Environment
+	manifestPath string // relative path to pipeline's manifest.yml file
 }
 
 type artifactBucket struct {
@@ -108,185 +218,308 @@ type artifactBucket struct {
 }
 
 func newInitPipelineOpts(vars initPipelineVars) (*initPipelineOpts, error) {
-	ws, err := workspace.New()
+	ws, err := workspace.Use(afero.NewOsFs())
 	if err != nil {
-		return nil, fmt.Errorf("new workspace client: %w", err)
+		return nil, err
 	}
 
-	secretsmanager, err := secretsmanager.New()
-	if err != nil {
-		return nil, fmt.Errorf("new secretsmanager client: %w", err)
-	}
-
-	p := sessions.NewProvider()
+	p := sessions.ImmutableProvider(sessions.UserAgentExtras("pipeline init"))
 	defaultSession, err := p.Default()
 	if err != nil {
 		return nil, err
 	}
 
-	ssmStore, err := config.NewStore()
-	if err != nil {
-		return nil, fmt.Errorf("new config store client: %w", err)
-	}
-
+	ssmStore := config.NewSSMStore(identity.New(defaultSession), ssm.New(defaultSession), aws.StringValue(defaultSession.Config.Region))
 	prompter := prompt.New()
+
+	wsAppName := tryReadingAppName()
+	if vars.appName == "" {
+		vars.appName = wsAppName
+	}
 
 	return &initPipelineOpts{
 		initPipelineVars: vars,
 		workspace:        ws,
-		secretsmanager:   secretsmanager,
+		secretsmanager:   secretsmanager.New(defaultSession),
 		parser:           template.New(),
 		sessProvider:     p,
-		cfnClient:        cloudformation.New(defaultSession),
+		cfnClient:        cloudformation.New(defaultSession, cloudformation.WithProgressTracker(os.Stderr)),
 		store:            ssmStore,
 		prompt:           prompter,
-		sel:              selector.NewSelect(prompter, ssmStore),
-		runner:           command.New(),
-		fs:               &afero.Afero{Fs: afero.NewOsFs()},
+		sel:              selector.NewAppEnvSelector(prompter, ssmStore),
+		runner:           exec.NewCmd(),
+		wsAppName:        wsAppName,
+		pipelineLister:   deploy.NewPipelineStore(rg.New(defaultSession)),
 	}, nil
 }
 
-// Validate returns an error if the flag values passed by the user are invalid.
+// Validate returns an error if the optional flag values passed by the user are invalid.
 func (o *initPipelineOpts) Validate() error {
-	if o.appName == "" {
-		return errNoAppInWorkspace
-	}
-	if _, err := o.store.GetApplication(o.appName); err != nil {
-		return err
-	}
-
-	if o.repoURL != "" {
-		if err := o.validateURL(o.repoURL); err != nil {
-			return err
-		}
-	}
-
-	if o.environments != nil {
-		for _, env := range o.environments {
-			_, err := o.store.GetEnvironment(o.appName, env)
-			if err != nil {
-				return err
-			}
-		}
-		return nil
-	}
 	return nil
 }
 
-// Ask prompts for fields that are required but not passed in.
+// Ask prompts for required fields that are not passed in and validates them.
 func (o *initPipelineOpts) Ask() error {
-	if err := o.askEnvs(); err != nil {
+	// This command must be executed in the app's workspace because the pipeline manifest and buildspec will be created and stored.
+	if err := validateWorkspaceApp(o.wsAppName, o.appName, o.store); err != nil {
 		return err
 	}
-	if err := o.askRepository(); err != nil {
+	o.appName = o.wsAppName
+
+	if err := o.askOrValidateURL(); err != nil {
 		return err
 	}
+
+	if err := o.parseRepoDetails(); err != nil {
+		return err
+	}
+
+	if o.repoBranch == "" {
+		o.getBranch()
+	}
+
+	if err := o.askOrValidatePipelineName(); err != nil {
+		return err
+	}
+
+	if err := o.askOrValidatePipelineType(); err != nil {
+		return err
+	}
+
+	if err := o.validateDuplicatePipeline(); err != nil {
+		return err
+	}
+
+	if len(o.environments) == 0 {
+		if err := o.askEnvs(); err != nil {
+			return err
+		}
+	}
+	if err := o.validateEnvs(); err != nil {
+		return err
+	}
+
 	return nil
 }
 
 // Execute writes the pipeline manifest file.
 func (o *initPipelineOpts) Execute() error {
-	if o.provider == ghProviderName {
+	if o.provider == manifest.GithubV1ProviderName {
 		if err := o.storeGitHubAccessToken(); err != nil {
 			return err
 		}
 	}
-
-	// write pipeline.yml file, populate with:
-	//   - git repo as source
-	//   - stage names (environments)
-	//   - enable/disable transition to prod envs
-	if err := o.createPipelineManifest(); err != nil {
+	log.Infoln()
+	ini := newPipelineInitializer(o)
+	if err := ini.writeManifest(); err != nil {
 		return err
 	}
-	if err := o.createBuildspec(); err != nil {
+	if err := ini.writeBuildspec(); err != nil {
 		return err
 	}
 	return nil
 }
 
-// RecommendedActions returns follow-up actions the user can take after successfully executing the command.
-func (o *initPipelineOpts) RecommendedActions() []string {
+// RequiredActions returns follow-up actions the user must take after successfully executing the command.
+func (o *initPipelineOpts) RequiredActions() []string {
 	return []string{
-		"Commit and push the generated buildspec and manifest file.",
-		fmt.Sprintf("Update the %s phase of your buildspec to unit test your services before pushing the images.", color.HighlightResource("build")),
-		"Update your pipeline manifest to add additional stages.",
-		fmt.Sprintf("Run %s to deploy your pipeline for the repository.", color.HighlightCode("copilot pipeline update")),
+		fmt.Sprintf("Commit and push the %s directory to your repository.", color.HighlightResource("copilot/")),
+		fmt.Sprintf("Run %s to create your pipeline.", color.HighlightCode("copilot pipeline deploy")),
 	}
+}
+
+// validateDuplicatePipeline checks that the pipeline name isn't already used
+// by another pipeline to reduce potential confusion with a legacy pipeline.
+func (o *initPipelineOpts) validateDuplicatePipeline() error {
+	var allPipelines []string
+
+	localPipelines, err := o.workspace.ListPipelines()
+	if err != nil {
+		return fmt.Errorf("get local pipelines: %w", err)
+	}
+	for _, pipeline := range localPipelines {
+		allPipelines = append(allPipelines, pipeline.Name)
+	}
+
+	deployedPipelines, err := o.pipelineLister.ListDeployedPipelines(o.appName)
+	if err != nil {
+		return fmt.Errorf("list deployed pipelines for app %s: %w", o.appName, err)
+	}
+	for _, pipeline := range deployedPipelines {
+		allPipelines = append(allPipelines, pipeline.Name)
+	}
+
+	fullName := fmt.Sprintf(fmtPipelineStackName, o.appName, o.name)
+	for _, pipeline := range allPipelines {
+		if strings.EqualFold(pipeline, o.name) || strings.EqualFold(pipeline, fullName) {
+			log.Warningf(`You already have a pipeline named '%s'.
+To deploy the existing pipeline, run %s.
+To recreate the pipeline, run %s,
+	optionally delete your pipeline.yml/manifest.yml and/or buildspec.yml file(s),
+	then run %s.
+If you have manually deleted your pipeline.yml/manifest.yml and/or buildspec.yml file(s) 
+	for the existing pipeline, Copilot will now generate new default file(s).
+To create an additional pipeline, run "copilot pipeline init" again, but with a new pipeline name.
+`, o.name, fmt.Sprintf(`"copilot pipeline deploy --name %s"`, o.name), fmt.Sprintf(`"copilot pipeline delete --name %s"`, o.name), fmt.Sprintf(`"copilot pipeline init --name %s"`, o.name))
+			return nil
+		}
+	}
+	return nil
+}
+
+func (o *initPipelineOpts) askOrValidatePipelineName() error {
+	if o.name == "" {
+		return o.askPipelineName()
+	}
+
+	return validatePipelineName(o.name, o.appName)
+}
+
+func (o *initPipelineOpts) askOrValidateURL() error {
+	if o.repoURL == "" {
+		return o.selectURL()
+	}
+
+	return o.validateURL(o.repoURL)
+}
+
+func (o *initPipelineOpts) askPipelineName() error {
+	promptOpts := []prompt.PromptConfig{
+		prompt.WithFinalMessage("Pipeline name:"),
+	}
+
+	// Only show suggestion if [repo]-[branch] is a valid pipeline name.
+	suggestion := strings.ToLower(fmt.Sprintf("%s-%s", o.repoName, o.repoBranch))
+	if err := validatePipelineName(suggestion, o.appName); err == nil {
+		promptOpts = append(promptOpts, prompt.WithDefaultInput(suggestion))
+	}
+
+	name, err := o.prompt.Get(fmt.Sprintf(fmtPipelineInitNamePrompt, color.Emphasize("name")),
+		pipelineInitNameHelpPrompt,
+		func(val interface{}) error {
+			return validatePipelineName(val, o.appName)
+		}, promptOpts...)
+	if err != nil {
+		return fmt.Errorf("get pipeline name: %w", err)
+	}
+
+	o.name = name
+	return nil
+}
+
+func (o *initPipelineOpts) askOrValidatePipelineType() error {
+	if o.pipelineType != "" {
+		for _, typ := range pipelineTypes {
+			if o.pipelineType == typ {
+				return nil
+			}
+		}
+		return fmt.Errorf("invalid pipeline type %q; must be one of %s", o.pipelineType, english.WordSeries(applyAll(pipelineTypes, strconv.Quote), "or"))
+	}
+
+	typ, err := o.prompt.SelectOption("What type of continuous delivery pipeline is this?",
+		"A pipeline can be set up to deploy either your workloads or your environments",
+		[]prompt.Option{
+			{
+				Value: pipelineTypeWorkloads,
+				Hint:  "Deploy the services or jobs in your workspace",
+			},
+			{
+				Value: pipelineTypeEnvironments,
+				Hint:  "Deploy the environments in your workspace",
+			},
+		})
+	if err != nil {
+		return fmt.Errorf("prompt for pipeline type: %w", err)
+	}
+	o.pipelineType = typ
+	return nil
 }
 
 func (o *initPipelineOpts) validateURL(url string) error {
 	// Note: no longer calling `validateDomainName` because if users use git-remote-codecommit
 	// (the HTTPS (GRC) protocol) to connect to CodeCommit, the url does not have any periods.
-	if !strings.Contains(url, githubURL) && !strings.Contains(url, ccIdentifier) {
-		return errors.New("Copilot currently accepts only URLs to GitHub and CodeCommit repository sources")
+	if !strings.Contains(url, githubURL) && !strings.Contains(url, ccIdentifier) && !strings.Contains(url, bbURL) {
+		return fmt.Errorf(fmtErrInvalidPipelineProvider, url, english.WordSeries(manifest.PipelineProviders, "or"))
 	}
+	return nil
+}
+
+// To avoid duplicating calls to GetEnvironment, validate and get config in the same step.
+func (o *initPipelineOpts) validateEnvs() error {
+	var envConfigs []*config.Environment
+	for _, env := range o.environments {
+		config, err := o.store.GetEnvironment(o.appName, env)
+		if err != nil {
+			return fmt.Errorf("validate environment %s: %w", env, err)
+		}
+		envConfigs = append(envConfigs, config)
+	}
+	o.envConfigs = envConfigs
 	return nil
 }
 
 func (o *initPipelineOpts) askEnvs() error {
-	if len(o.environments) == 0 {
-		envs, err := o.sel.Environments(pipelineSelectEnvPrompt, pipelineSelectEnvHelpPrompt, o.appName, func(order int) prompt.Option {
-			return prompt.WithFinalMessage(fmt.Sprintf("%s stage:", humanize.Ordinal(order)))
-		})
-		if err != nil {
-			return fmt.Errorf("select environments: %w", err)
-		}
-		o.environments = envs
+	envs, err := o.sel.Environments(pipelineSelectEnvPrompt, pipelineSelectEnvHelpPrompt, o.appName, func(order int) prompt.PromptConfig {
+		return prompt.WithFinalMessage(fmt.Sprintf("%s stage:", humanize.Ordinal(order)))
+	})
+	if err != nil {
+		return fmt.Errorf("select environments: %w", err)
 	}
 
-	var envConfigs []*config.Environment
-	for _, environment := range o.environments {
-		envConfig, err := o.store.GetEnvironment(o.appName, environment)
-		if err != nil {
-			return fmt.Errorf("get config of environment: %w", err)
-		}
-		envConfigs = append(envConfigs, envConfig)
-	}
-	o.envConfigs = envConfigs
-
+	o.environments = envs
 	return nil
 }
 
-func (o *initPipelineOpts) askRepository() error {
-	var err error
-	if o.repoURL == "" {
-		if err = o.selectURL(); err != nil {
-			return err
-		}
-	}
-
+func (o *initPipelineOpts) parseRepoDetails() error {
 	switch {
 	case strings.Contains(o.repoURL, githubURL):
-		return o.askGitHubRepoDetails()
+		return o.parseGitHubRepoDetails()
 	case strings.Contains(o.repoURL, ccIdentifier):
-		return o.askCodeCommitRepoDetails()
+		return o.parseCodeCommitRepoDetails()
+	case strings.Contains(o.repoURL, bbURL):
+		return o.parseBitbucketRepoDetails()
+	default:
+		return fmt.Errorf(fmtErrInvalidPipelineProvider, o.repoURL, english.WordSeries(manifest.PipelineProviders, "or"))
 	}
-	return nil
 }
 
-func (o *initPipelineOpts) askGitHubRepoDetails() error {
-	o.provider = ghProviderName
+// getBranch fetches the user's current branch as a best-guess of which branch they want their pipeline to follow. If err, insert default branch name.
+func (o *initPipelineOpts) getBranch() {
+	// Fetches local git branch.
+	err := o.runner.Run("git", []string{"rev-parse", "--abbrev-ref", "HEAD"}, exec.Stdout(&o.buffer))
+	o.repoBranch = strings.TrimSpace(o.buffer.String())
+	if err != nil {
+		o.repoBranch = defaultBranch
+	}
+	if strings.TrimSpace(o.buffer.String()) == "" {
+		o.repoBranch = defaultBranch
+	}
+	o.buffer.Reset()
+	log.Infof(`Your pipeline will follow branch '%s'.
+`, color.HighlightUserInput(o.repoBranch))
+}
+
+func (o *initPipelineOpts) parseGitHubRepoDetails() error {
+	// If the user uses a flag to specify a GitHub access token,
+	// GitHub version 1 (not CSC) is the provider.
+	o.provider = manifest.GithubProviderName
+	if o.githubAccessToken != "" {
+		o.provider = manifest.GithubV1ProviderName
+	}
+
 	repoDetails, err := ghRepoURL(o.repoURL).parse()
 	if err != nil {
 		return err
 	}
 	o.repoName = repoDetails.name
-	o.githubOwner = repoDetails.owner
+	o.repoOwner = repoDetails.owner
 
-	if o.githubAccessToken == "" {
-		if err = o.getGitHubAccessToken(); err != nil {
-			return err
-		}
-	}
-	if o.repoBranch == "" {
-		o.repoBranch = defaultGHBranch
-	}
 	return nil
 }
 
-func (o *initPipelineOpts) askCodeCommitRepoDetails() error {
-	o.provider = ccProviderName
+func (o *initPipelineOpts) parseCodeCommitRepoDetails() error {
+	o.provider = manifest.CodeCommitProviderName
 	repoDetails, err := ccRepoURL(o.repoURL).parse()
 	if err != nil {
 		return err
@@ -300,19 +533,31 @@ func (o *initPipelineOpts) askCodeCommitRepoDetails() error {
 		return fmt.Errorf("retrieve default session: %w", err)
 	}
 	region := aws.StringValue(sess.Config.Region)
+	if o.ccRegion == "" {
+		o.ccRegion = region
+	}
 	if o.ccRegion != region {
 		return fmt.Errorf("repository %s is in %s, but app %s is in %s; they must be in the same region", o.repoName, o.ccRegion, o.appName, region)
 	}
 
-	if o.repoBranch == "" {
-		o.repoBranch = defaultCCBranch
+	return nil
+}
+
+func (o *initPipelineOpts) parseBitbucketRepoDetails() error {
+	o.provider = manifest.BitbucketProviderName
+	repoDetails, err := bbRepoURL(o.repoURL).parse()
+	if err != nil {
+		return err
 	}
+	o.repoName = repoDetails.name
+	o.repoOwner = repoDetails.owner
+
 	return nil
 }
 
 func (o *initPipelineOpts) selectURL() error {
 	// Fetches and parses all remote repositories.
-	err := o.runner.Run("git", []string{"remote", "-v"}, command.Stdout(&o.buffer))
+	err := o.runner.Run("git", []string{"remote", "-v"}, exec.Stdout(&o.buffer))
 	if err != nil {
 		return fmt.Errorf("get remote repository info: %w; make sure you have installed Git and are in a Git repository", err)
 	}
@@ -322,17 +567,23 @@ func (o *initPipelineOpts) selectURL() error {
 	}
 	o.buffer.Reset()
 
+	// If there is only one returned URL, set it rather than prompt to select.
+	if len(urls) == 1 {
+		log.Infof(`Only one git remote detected. Your pipeline will follow '%s'.
+`, color.HighlightUserInput(urls[0]))
+		o.repoURL = urls[0]
+		return nil
+	}
+
 	// Prompts user to select a repo URL.
 	url, err := o.prompt.SelectOne(
 		pipelineSelectURLPrompt,
 		pipelineSelectURLHelpPrompt,
 		urls,
+		prompt.WithFinalMessage("Repository URL:"),
 	)
 	if err != nil {
 		return fmt.Errorf("select URL: %w", err)
-	}
-	if err := o.validateURL(url); err != nil {
-		return err
 	}
 	o.repoURL = url
 
@@ -348,6 +599,8 @@ func (o *initPipelineOpts) selectURL() error {
 // https	https://git-codecommit.us-west-2.amazonaws.com/v1/repos/aws-sample (fetch)
 // fed		codecommit::us-west-2://aws-sample (fetch)
 // ssh		ssh://git-codecommit.us-west-2.amazonaws.com/v1/repos/aws-sample (push)
+// bbhttps	https://huanjani@bitbucket.org/huanjani/aws-copilot-sample-service.git (fetch)
+// bbssh	ssh://git@bitbucket.org:teamsinspace/documentation-tests.git (fetch)
 
 // parseGitRemoteResults returns just the trimmed middle column (url) of the `git remote -v` results,
 // and skips urls from unsupported sources.
@@ -356,7 +609,7 @@ func (o *initPipelineOpts) parseGitRemoteResult(s string) ([]string, error) {
 	urlSet := make(map[string]bool)
 	items := strings.Split(s, "\n")
 	for _, item := range items {
-		if !strings.Contains(item, githubURL) && !strings.Contains(item, ccIdentifier) {
+		if !strings.Contains(item, githubURL) && !strings.Contains(item, ccIdentifier) && !strings.Contains(item, bbURL) {
 			continue
 		}
 		cols := strings.Split(item, "\t")
@@ -378,6 +631,12 @@ type ccRepoURL string
 type ccRepoDetails struct {
 	name   string
 	region string
+}
+
+type bbRepoURL string
+type bbRepoDetails struct {
+	name  string
+	owner string
 }
 
 func (url ghRepoURL) parse() (ghRepoDetails, error) {
@@ -406,13 +665,17 @@ func (url ccRepoURL) parse() (ccRepoDetails, error) {
 	case strings.HasPrefix(urlString, "codecommit::"):
 		parsedURL := strings.Split(urlString, ":")
 		region = parsedURL[2]
+	case strings.HasPrefix(urlString, "codecommit://"):
+		// Use default profile region.
 	default:
 		return ccRepoDetails{}, fmt.Errorf("unknown CodeCommit URL format: %s", url)
 	}
-	// Double-check that parsed results is a valid region. Source: https://www.regextester.com/109163
-	match, _ := regexp.MatchString(`(us(-gov)?|ap|ca|cn|eu|sa)-(central|(north|south)?(east|west)?)-\d`, region)
-	if !match {
-		return ccRepoDetails{}, fmt.Errorf("unable to parse the AWS region from %s", url)
+	if region != "" {
+		// Double-check that parsed results is a valid region. Source: https://www.regextester.com/109163
+		match, _ := regexp.MatchString(`(us(-gov)?|ap|ca|cn|eu|sa)-(central|(north|south)?(east|west)?)-\d`, region)
+		if !match {
+			return ccRepoDetails{}, fmt.Errorf("unable to parse the AWS region from %s", url)
+		}
 	}
 
 	// Parse repo name.
@@ -428,18 +691,24 @@ func (url ccRepoURL) parse() (ccRepoDetails, error) {
 	}, nil
 }
 
-func (o *initPipelineOpts) getGitHubAccessToken() error {
-	token, err := o.prompt.GetSecret(
-		fmt.Sprintf("Please enter your GitHub Personal Access Token for your repository %s:", color.HighlightUserInput(o.repoName)),
-		`The personal access token for the GitHub repository linked to your workspace. 
-For more information, please refer to: https://git.io/JfDFD.`,
-	)
-
-	if err != nil {
-		return fmt.Errorf("get GitHub access token: %w", err)
+// Bitbucket URLs, post-parseGitRemoteResults(), may look like:
+// https://username@bitbucket.org/teamsinspace/documentation-tests
+// ssh://git@bitbucket.org:teamsinspace/documentation-tests
+func (url bbRepoURL) parse() (bbRepoDetails, error) {
+	urlString := string(url)
+	splitURL := strings.Split(urlString, "/")
+	if len(splitURL) < 2 {
+		return bbRepoDetails{}, fmt.Errorf("unable to parse the Bitbucket repository name from %s", url)
 	}
-	o.githubAccessToken = token
-	return nil
+	repoName := splitURL[len(splitURL)-1]
+	// rather than check for the SSH prefix, split on colon here; HTTPS version will be unaffected.
+	splitRepoOwner := strings.Split(splitURL[len(splitURL)-2], ":")
+	repoOwner := splitRepoOwner[len(splitRepoOwner)-1]
+
+	return bbRepoDetails{
+		name:  repoName,
+		owner: repoOwner,
+	}, nil
 }
 
 func (o *initPipelineOpts) storeGitHubAccessToken() error {
@@ -459,74 +728,67 @@ func (o *initPipelineOpts) storeGitHubAccessToken() error {
 	return nil
 }
 
-func (o *initPipelineOpts) createPipelineManifest() error {
-	pipelineName, err := o.pipelineName()
-	if err != nil {
-		return err
-	}
+func (o *initPipelineOpts) createPipelineManifest(stages []manifest.PipelineStage) error {
 	provider, err := o.pipelineProvider()
 	if err != nil {
 		return err
 	}
-
-	var stages []manifest.PipelineStage
-	for _, env := range o.envConfigs {
-
-		stage := manifest.PipelineStage{
-			Name:             env.Name,
-			RequiresApproval: env.Prod,
-		}
-		stages = append(stages, stage)
-	}
-
-	manifest, err := manifest.NewPipelineManifest(pipelineName, provider, stages)
+	manifest, err := manifest.NewPipeline(o.name, provider, stages)
 	if err != nil {
 		return fmt.Errorf("generate a pipeline manifest: %w", err)
 	}
 
 	var manifestExists bool
-	manifestPath, err := o.workspace.WritePipelineManifest(manifest)
+	o.manifestPath, err = o.workspace.WritePipelineManifest(manifest, o.name)
 	if err != nil {
 		e, ok := err.(*workspace.ErrFileExists)
 		if !ok {
 			return fmt.Errorf("write pipeline manifest to workspace: %w", err)
 		}
 		manifestExists = true
-		manifestPath = e.FileName
+		o.manifestPath = e.FileName
 	}
 
-	manifestPath, err = relPath(manifestPath)
+	mftPath := displayPath(o.manifestPath)
+
+	o.manifestPath, err = o.workspace.Rel(o.manifestPath)
 	if err != nil {
 		return err
 	}
 
-	manifestMsgFmt := "Wrote the pipeline manifest for %s at '%s'\n"
 	if manifestExists {
-		manifestMsgFmt = "Pipeline manifest file for %s already exists at %s, skipping writing it.\n"
+		log.Infof(`Pipeline manifest file for %s already exists at %s, skipping writing it.
+Previously set repository URL, branch, and environment stages will remain.
+`, color.HighlightUserInput(o.repoName), color.HighlightResource(mftPath))
+	} else {
+		log.Successf("Wrote the pipeline manifest for %s at '%s'\n", color.HighlightUserInput(o.repoName), color.HighlightResource(mftPath))
 	}
-	log.Successf(manifestMsgFmt, color.HighlightUserInput(o.repoName), color.HighlightResource(manifestPath))
-	log.Infoln("The manifest contains configurations for your CodePipeline resources, such as your pipeline stages and build steps.")
+	log.Debug(`The manifest contains configurations for your pipeline.
+Update the file to add stages, change the tracked branch, add test commands or manual approval actions.
+`)
 	return nil
 }
 
-func (o *initPipelineOpts) createBuildspec() error {
+func (o *initPipelineOpts) createBuildspec(buildSpecTemplatePath string) error {
 	artifactBuckets, err := o.artifactBuckets()
 	if err != nil {
 		return err
 	}
-	content, err := o.parser.Parse(buildspecTemplatePath, struct {
+	content, err := o.parser.Parse(buildSpecTemplatePath, struct {
 		BinaryS3BucketPath string
 		Version            string
+		ManifestPath       string
 		ArtifactBuckets    []artifactBucket
 	}{
 		BinaryS3BucketPath: binaryS3BucketPath,
 		Version:            version.Version,
+		ManifestPath:       filepath.ToSlash(o.manifestPath), // The manifest path must be rendered in the buildspec with '/' instead of os-specific separator.
 		ArtifactBuckets:    artifactBuckets,
-	})
+	}, template.WithFuncs(buildspecTemplateFunctions))
 	if err != nil {
 		return err
 	}
-	buildspecPath, err := o.workspace.WritePipelineBuildspec(content)
+	buildspecPath, err := o.workspace.WritePipelineBuildspec(content, o.name)
 	var buildspecExists bool
 	if err != nil {
 		e, ok := err.(*workspace.ErrFileExists)
@@ -536,17 +798,14 @@ func (o *initPipelineOpts) createBuildspec() error {
 		buildspecExists = true
 		buildspecPath = e.FileName
 	}
-	buildspecMsgFmt := "Wrote the buildspec for the pipeline's build stage at '%s'\n"
+	buildspecPath = displayPath(buildspecPath)
 	if buildspecExists {
-		buildspecMsgFmt = "Buildspec file for pipeline already exists at %s, skipping writing it.\n"
+		log.Infof(`Buildspec file for pipeline already exists at %s, skipping writing it.
+Previously set config will remain.
+`, color.HighlightResource(buildspecPath))
+		return nil
 	}
-	buildspecPath, err = relPath(buildspecPath)
-	if err != nil {
-		return err
-	}
-	log.Successf(buildspecMsgFmt, color.HighlightResource(buildspecPath))
-	log.Infoln("The buildspec contains the commands to build and push your container images to your ECR repositories.")
-
+	log.Successf("Wrote the buildspec for the pipeline's build stage at '%s'\n", color.HighlightResource(buildspecPath))
 	return nil
 }
 
@@ -554,33 +813,34 @@ func (o *initPipelineOpts) secretName() string {
 	return fmt.Sprintf(fmtSecretName, o.appName, o.repoName)
 }
 
-func (o *initPipelineOpts) pipelineName() (string, error) {
-	if o.provider == ghProviderName {
-		return fmt.Sprintf(fmtGHPipelineName, o.appName, o.githubOwner, o.repoName), nil
-	}
-	if o.provider == ccProviderName {
-		return fmt.Sprintf(fmtCCPipelineName, o.appName, o.repoName), nil
-	}
-	return "", fmt.Errorf("unable to create pipeline name for repo %s from provider %s", o.repoName, o.provider)
-}
-
 func (o *initPipelineOpts) pipelineProvider() (manifest.Provider, error) {
-	if o.provider == ghProviderName {
-		config := &manifest.GitHubProperties{
-			RepositoryURL:         fmt.Sprintf(fmtGHRepoURL, githubURL, o.githubOwner, o.repoName),
+	var config interface{}
+	switch o.provider {
+	case manifest.GithubV1ProviderName:
+		config = &manifest.GitHubV1Properties{
+			RepositoryURL:         fmt.Sprintf(fmtGHRepoURL, githubURL, o.repoOwner, o.repoName),
 			Branch:                o.repoBranch,
 			GithubSecretIdKeyName: o.secret,
 		}
-		return manifest.NewProvider(config)
-	}
-	if o.provider == ccProviderName {
-		config := &manifest.CodeCommitProperties{
+	case manifest.GithubProviderName:
+		config = &manifest.GitHubProperties{
+			RepositoryURL: fmt.Sprintf(fmtGHRepoURL, githubURL, o.repoOwner, o.repoName),
+			Branch:        o.repoBranch,
+		}
+	case manifest.CodeCommitProviderName:
+		config = &manifest.CodeCommitProperties{
 			RepositoryURL: fmt.Sprintf(fmtCCRepoURL, o.ccRegion, awsURL, o.repoName),
 			Branch:        o.repoBranch,
 		}
-		return manifest.NewProvider(config)
+	case manifest.BitbucketProviderName:
+		config = &manifest.BitbucketProperties{
+			RepositoryURL: fmt.Sprintf(fmtBBRepoURL, bbURL, o.repoOwner, o.repoName),
+			Branch:        o.repoBranch,
+		}
+	default:
+		return nil, fmt.Errorf("unable to create pipeline source provider for %s", o.repoName)
 	}
-	return nil, fmt.Errorf("unable to create pipeline source provider for %s", o.repoName)
+	return manifest.NewProvider(config)
 }
 
 func (o *initPipelineOpts) artifactBuckets() ([]artifactBucket, error) {
@@ -621,8 +881,9 @@ func buildPipelineInitCmd() *cobra.Command {
 		Example: `
   Create a pipeline for the services in your workspace.
   /code $ copilot pipeline init \
-  /code  --url https://github.com/gitHubUserName/myFrontendApp.git \
-  /code  --github-access-token file://myGitHubToken \
+  /code  --name frontend-main \
+  /code  --url https://github.com/gitHubUserName/frontend.git \
+  /code  --git-branch main \
   /code  --environments "stage,prod"`,
 		RunE: runCmdE(func(cmd *cobra.Command, args []string) error {
 			opts, err := newInitPipelineOpts(vars)
@@ -639,20 +900,22 @@ func buildPipelineInitCmd() *cobra.Command {
 				return err
 			}
 			log.Infoln()
-			log.Infoln("Recommended follow-up actions:")
-			for _, followup := range opts.RecommendedActions() {
+			log.Infoln("Required follow-up actions:")
+			for _, followup := range opts.RequiredActions() {
 				log.Infof("- %s\n", followup)
 			}
 			return nil
 		}),
 	}
-	cmd.Flags().StringVarP(&vars.appName, appFlag, appFlagShort, tryReadingAppName(), appFlagDescription)
+	cmd.Flags().StringVarP(&vars.appName, appFlag, appFlagShort, "", appFlagDescription)
+	cmd.Flags().StringVarP(&vars.name, nameFlag, nameFlagShort, "", pipelineFlagDescription)
 	cmd.Flags().StringVar(&vars.repoURL, githubURLFlag, "", githubURLFlagDescription)
 	_ = cmd.Flags().MarkHidden(githubURLFlag)
 	cmd.Flags().StringVarP(&vars.repoURL, repoURLFlag, repoURLFlagShort, "", repoURLFlagDescription)
 	cmd.Flags().StringVarP(&vars.githubAccessToken, githubAccessTokenFlag, githubAccessTokenFlagShort, "", githubAccessTokenFlagDescription)
+	_ = cmd.Flags().MarkHidden(githubAccessTokenFlag)
 	cmd.Flags().StringVarP(&vars.repoBranch, gitBranchFlag, gitBranchFlagShort, "", gitBranchFlagDescription)
 	cmd.Flags().StringSliceVarP(&vars.environments, envsFlag, envsFlagShort, []string{}, pipelineEnvsFlagDescription)
-
+	cmd.Flags().StringVarP(&vars.pipelineType, pipelineTypeFlag, pipelineTypeShort, "", pipelineTypeFlagDescription)
 	return cmd
 }

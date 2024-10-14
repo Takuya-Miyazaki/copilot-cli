@@ -19,6 +19,16 @@ func (e *ErrChangeSetEmpty) Error() string {
 	return fmt.Sprintf("change set with name %s for stack %s has no changes", e.cs.name, e.cs.stackName)
 }
 
+// NewMockErrChangeSetEmpty creates a mock ErrChangeSetEmpty.
+func NewMockErrChangeSetEmpty() *ErrChangeSetEmpty {
+	return &ErrChangeSetEmpty{
+		cs: &changeSet{
+			name:      "mockChangeSet",
+			stackName: "mockStack",
+		},
+	}
+}
+
 // ErrStackAlreadyExists occurs when a CloudFormation stack already exists with a given name.
 type ErrStackAlreadyExists struct {
 	Name  string
@@ -64,6 +74,20 @@ func stackDoesNotExist(err error) bool {
 		case "ValidationError":
 			// A ValidationError occurs if we describe a stack which doesn't exist.
 			if strings.Contains(aerr.Message(), "does not exist") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// cancelUpdateStackNotInUpdateProgress returns true if the underlying error is CancelUpdateStack
+// cannot be called for a stack that is not in UPDATE_IN_PROGRESS state.
+func cancelUpdateStackNotInUpdateProgress(err error) bool {
+	if aerr, ok := err.(awserr.Error); ok {
+		switch aerr.Code() {
+		case "ValidationError":
+			if strings.Contains(aerr.Message(), "CancelUpdateStack cannot be called from current stack status") {
 				return true
 			}
 		}

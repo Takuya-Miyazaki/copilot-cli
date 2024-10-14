@@ -2,15 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 "use strict";
 
-const aws = require("aws-sdk");
+const { CloudFormation, waitUntilStackUpdateComplete, DescribeStacksCommand, UpdateStackCommand } = require("@aws-sdk/client-cloudformation");
 
 // These are used for test purposes only
 let defaultResponseURL;
+let defaultLogGroup;
+let defaultLogStream;
 
-const updateStackWaiter = {
-  delay: 30,
-  maxAttempts: 29,
-};
+
+const AliasParamKey = "Aliases";
+
+// Per the doc at https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/crpg-ref-responses.html
+// the size of the response body should not exceed 4096 bytes.
+// Therefore, we should ignore any outputs that we don't need.
+let ignoredEnvOutputs = new Set(["EnabledFeatures", "LastForceDeployID"]);
 
 /**
  * Upload a CloudFormation response object to S3.
@@ -75,60 +80,93 @@ let report = function (
 /**
  * Update the environment stack's parameters by adding or removing {workload} from the provided {parameters}.
  *
- * @param {string} requestType Type of the request.
  * @param {string} stackName Name of the stack.
  * @param {string} workload Name of the copilot workload.
- * @param {string[]} envParameters List of parameters from the environment stack to update.
+ * @param {string[]} envControllerParameters List of parameters from the environment stack to update.
  *
  * @returns {parameters} The updated parameters.
  */
 const controlEnv = async function (
-  requestType,
   stackName,
   workload,
-  envParameters
+  aliases,
+  envControllerParameters
 ) {
-  var cfn = new aws.CloudFormation();
+  var cfn = new CloudFormation();
+  aliases = aliases || [];
+  envControllerParameters = envControllerParameters || [];
   while (true) {
     var describeStackResp = await cfn
-      .describeStacks({
-        StackName: stackName,
-      })
-      .promise();
+      .send(new DescribeStacksCommand({ 
+        StackName: stackName 
+      }));
     if (describeStackResp.Stacks.length !== 1) {
       throw new Error(`Cannot find environment stack ${stackName}`);
     }
-    var updatedEnvStack = describeStackResp.Stacks[0];
-    var params = JSON.parse(JSON.stringify(updatedEnvStack.Parameters));
-    var updated = false;
-    for (const param of params) {
-      for (const envParam of envParameters) {
-        if (param.ParameterKey === envParam) {
-          const [updatedParamValue, paramUpdated] = updateParameter(
-            requestType,
-            workload,
-            param.ParameterValue
-          );
-          param.ParameterValue = updatedParamValue;
-          updated = updated || paramUpdated;
-        }
-      }
-    }
+    const updatedEnvStack = describeStackResp.Stacks[0];
+    const envParams = JSON.parse(JSON.stringify(updatedEnvStack.Parameters));
+    const envSet = setOfParameterKeysWithWorkload(envParams, workload);
+    const controllerSet = new Set(
+      envControllerParameters.filter((param) => param.endsWith("Workloads"))
+    );
+
+    const parametersToRemove = [...envSet].filter(
+      (param) => !controllerSet.has(param)
+    );
+    const parametersToAdd = [...controllerSet].filter(
+      (param) => !envSet.has(param)
+    );
     const exportedValues = getExportedValues(updatedEnvStack);
-    // Return if there's no parameter changes.
-    if (!updated) {
+    // If there are no changes in env-controller managed parameters, the custom 
+    // resource may have been triggered because the env template is upgraded, 
+    // and the service template is attempting to retrieve the latest Outputs
+    // from the env stack (see PR #3957). Return the updated Outputs instead 
+    // of triggering an env-controller update of the environment.
+    const shouldUpdateAliases = needUpdateAliases(envParams, workload, aliases);
+    if (
+      parametersToRemove.length + parametersToAdd.length === 0 &&
+      !shouldUpdateAliases
+    ) {
       return exportedValues;
     }
+
+    for (const envParam of envParams) {
+      if (envParam.ParameterKey === AliasParamKey) {
+        if (shouldUpdateAliases) {
+          envParam.ParameterValue = updateAliases(
+            envParam.ParameterValue,
+            workload,
+            aliases
+          );
+        }
+        continue;
+      }
+      if (parametersToRemove.includes(envParam.ParameterKey)) {
+        const values = new Set(
+          envParam.ParameterValue.split(",").filter(Boolean)
+        ); // Filter out the empty string
+        // in the output array to prevent a leading comma in the parameters list.
+        values.delete(workload);
+        envParam.ParameterValue = [...values].join(",");
+      }
+      if (parametersToAdd.includes(envParam.ParameterKey)) {
+        const values = new Set(
+          envParam.ParameterValue.split(",").filter(Boolean)
+        );
+        values.add(workload);
+        envParam.ParameterValue = [...values].join(",");
+      }
+    }
+
     try {
       await cfn
-        .updateStack({
+        .send(new UpdateStackCommand({
           StackName: stackName,
-          Parameters: params,
+          Parameters: envParams,
           UsePreviousTemplate: true,
           RoleARN: exportedValues["CFNExecutionRoleARN"],
           Capabilities: updatedEnvStack.Capabilities,
-        })
-        .promise();
+      }));
     } catch (err) {
       if (
         !err.message.match(
@@ -138,26 +176,15 @@ const controlEnv = async function (
         throw err;
       }
       // If the other workload is updating the env stack, wait until update completes.
-      await cfn
-        .waitFor("stackUpdateComplete", {
-          StackName: stackName,
-          $waiter: updateStackWaiter,
-        })
-        .promise();
+      await exports.waitForStackUpdate(cfn, stackName);
       continue;
     }
     // Wait until update complete, then return the updated env stack output.
-    await cfn
-      .waitFor("stackUpdateComplete", {
-        StackName: stackName,
-        $waiter: updateStackWaiter,
-      })
-      .promise();
+    await exports.waitForStackUpdate(cfn, stackName);
     describeStackResp = await cfn
-      .describeStacks({
+      .send(new DescribeStacksCommand({
         StackName: stackName,
-      })
-      .promise();
+      }));
     if (describeStackResp.Stacks.length !== 1) {
       throw new Error(`Cannot find environment stack ${stackName}`);
     }
@@ -165,13 +192,26 @@ const controlEnv = async function (
   }
 };
 
+const waitForStackUpdate = async function (cfn, stackName) {
+  await waitUntilStackUpdateComplete({
+    client: cfn,
+    maxWaitTime: 30 * 29,
+    minDelay: 30,
+    maxDelay: 30,
+  },{
+    StackName: stackName,
+  });
+};
+
 /**
  * Environment controller handler, invoked by Lambda.
  */
 exports.handler = async function (event, context) {
   var responseData = {};
-  var physicalResourceId;
   const props = event.ResourceProperties;
+  const physicalResourceId =
+    event.PhysicalResourceId ||
+    `envcontoller/${props.EnvStack}/${props.Workload}`;
 
   try {
     switch (event.RequestType) {
@@ -179,37 +219,33 @@ exports.handler = async function (event, context) {
         responseData = await Promise.race([
           exports.deadlineExpired(),
           controlEnv(
-            "Create",
             props.EnvStack,
             props.Workload,
+            props.Aliases,
             props.Parameters
           ),
         ]);
-        physicalResourceId = `envcontoller/${props.EnvStack}/${props.Workload}`;
         break;
       case "Update":
         responseData = await Promise.race([
           exports.deadlineExpired(),
           controlEnv(
-            "Update",
             props.EnvStack,
             props.Workload,
+            props.Aliases,
             props.Parameters
           ),
         ]);
-        physicalResourceId = event.PhysicalResourceId;
         break;
       case "Delete":
         responseData = await Promise.race([
           exports.deadlineExpired(),
           controlEnv(
-            "Delete",
             props.EnvStack,
             props.Workload,
-            props.Parameters
+            [] // Set to empty to denote that Workload should not be included in any env stack parameter.
           ),
         ]);
-        physicalResourceId = event.PhysicalResourceId;
         break;
       default:
         throw new Error(`Unsupported request type ${event.RequestType}`);
@@ -217,20 +253,67 @@ exports.handler = async function (event, context) {
     await report(event, context, "SUCCESS", physicalResourceId, responseData);
   } catch (err) {
     console.log(`Caught error ${err}.`);
+    console.log(
+      `Responding FAILED for physical resource id: ${physicalResourceId}`
+    );
     await report(
       event,
       context,
       "FAILED",
       physicalResourceId,
       null,
-      err.message
+      `${err.message} (Log: ${defaultLogGroup || context.logGroupName}/${
+        defaultLogStream || context.logStreamName
+      })`
     );
   }
+};
+
+function setOfParameterKeysWithWorkload(cfnParams, workload) {
+  const envSet = new Set();
+  cfnParams.forEach((param) => {
+    if (!param.ParameterKey.endsWith("Workloads")) {
+      return;
+    }
+    let values = new Set(param.ParameterValue.split(","));
+    if (!values.has(workload)) {
+      return;
+    }
+    envSet.add(param.ParameterKey);
+  });
+  return envSet;
+}
+
+function needUpdateAliases(cfnParams, workload, aliases) {
+  for (const param of cfnParams) {
+    if (param.ParameterKey !== AliasParamKey) {
+      continue;
+    }
+    let obj = JSON.parse(param.ParameterValue || "{}");
+    if ((obj[workload] || []).toString() !== aliases.toString()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+const updateAliases = function (cfnAliases, workload, aliases) {
+  let obj = JSON.parse(cfnAliases || "{}");
+  if (aliases.length !== 0) {
+    obj[workload] = aliases;
+  } else {
+    obj[workload] = undefined;
+  }
+  const updatedAliases = JSON.stringify(obj);
+  return updatedAliases === "{}" ? "" : updatedAliases;
 };
 
 const getExportedValues = function (stack) {
   const exportedValues = {};
   stack.Outputs.forEach((output) => {
+    if (ignoredEnvOutputs.has(output.OutputKey)) {
+      return;
+    }
     exportedValues[output.OutputKey] = output.OutputValue;
   });
   return exportedValues;
@@ -246,28 +329,6 @@ const getExportedValues = function (stack) {
  * @returns {string} The updated parameter.
  * @returns {bool} whether the parameter is modified.
  */
-const updateParameter = function (requestType, workload, paramValue) {
-  var set = new Set(
-    paramValue.split(",").filter(function (el) {
-      return el != "";
-    })
-  );
-  switch (requestType) {
-    case "Create":
-      set.add(workload);
-      break;
-    case "Update":
-      set.add(workload);
-      break;
-    case "Delete":
-      set.delete(workload);
-      break;
-    default:
-      throw new Error(`Unsupported request type ${requestType}`);
-  }
-  var updatedParamValue = Array.from(set).join(",");
-  return [updatedParamValue, updatedParamValue !== paramValue];
-};
 
 exports.deadlineExpired = function () {
   return new Promise(function (resolve, reject) {
@@ -285,3 +346,24 @@ exports.deadlineExpired = function () {
 exports.withDefaultResponseURL = function (url) {
   defaultResponseURL = url;
 };
+
+/**
+ * @private
+ */
+exports.withDefaultLogStream = function (logStream) {
+  defaultLogStream = logStream;
+};
+
+/**
+ * @private
+ */
+exports.withDefaultLogGroup = function (logGroup) {
+  defaultLogGroup = logGroup;
+};
+
+/**
+ * @private
+ */
+exports.waitForStackUpdate = function(cfn, stackName) {
+  return waitForStackUpdate(cfn, stackName);
+}

@@ -6,193 +6,332 @@ package stack
 import (
 	"fmt"
 	"strconv"
+	"strings"
+
+	"github.com/aws/copilot-cli/internal/pkg/aws/elbv2"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/cloudformation"
-	"github.com/aws/copilot-cli/internal/pkg/addon"
+	"github.com/aws/copilot-cli/internal/pkg/config"
+	"github.com/aws/copilot-cli/internal/pkg/deploy"
+	"github.com/aws/copilot-cli/internal/pkg/deploy/upload/customresource"
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
 	"github.com/aws/copilot-cli/internal/pkg/template"
-)
-
-// Template rendering configuration.
-const (
-	lbWebSvcRulePriorityGeneratorPath = "custom-resources/alb-rule-priority-generator.js"
-	desiredCountGeneratorPath         = "custom-resources/desired-count-delegation.js"
-	envControllerPath                 = "custom-resources/env-controller.js"
+	"github.com/aws/copilot-cli/internal/pkg/template/override"
 )
 
 // Parameter logical IDs for a load balanced web service.
 const (
-	LBWebServiceHTTPSParamKey           = "HTTPSEnabled"
-	LBWebServiceContainerPortParamKey   = "ContainerPort"
-	LBWebServiceRulePathParamKey        = "RulePath"
-	LBWebServiceTargetContainerParamKey = "TargetContainer"
-	LBWebServiceTargetPortParamKey      = "TargetPort"
-	LBWebServiceStickinessParamKey      = "Stickiness"
+	LBWebServiceDNSDelegatedParamKey = "DNSDelegated"
+	LBWebServiceNLBAliasesParamKey   = "NLBAliases"
+	LBWebServiceNLBPortParamKey      = "NLBPort"
 )
-
-type loadBalancedWebSvcReadParser interface {
-	template.ReadParser
-	ParseLoadBalancedWebService(template.WorkloadOpts) (*template.Content, error)
-}
 
 // LoadBalancedWebService represents the configuration needed to create a CloudFormation stack from a load balanced web service manifest.
 type LoadBalancedWebService struct {
-	*wkld
-	manifest     *manifest.LoadBalancedWebService
-	httpsEnabled bool
+	*ecsWkld
+	manifest             *manifest.LoadBalancedWebService
+	httpsEnabled         bool
+	dnsDelegationEnabled bool
+	importedALB          *elbv2.LoadBalancer
+	appInfo              deploy.AppInformation
 
 	parser loadBalancedWebSvcReadParser
 }
 
-// NewLoadBalancedWebService creates a new LoadBalancedWebService stack from a manifest file.
-func NewLoadBalancedWebService(mft *manifest.LoadBalancedWebService, env, app string, rc RuntimeConfig) (*LoadBalancedWebService, error) {
-	parser := template.New()
-	addons, err := addon.New(aws.StringValue(mft.Name))
-	if err != nil {
-		return nil, fmt.Errorf("new addons: %w", err)
-	}
-	envManifest, err := mft.ApplyEnv(env) // Apply environment overrides to the manifest values.
-	if err != nil {
-		return nil, fmt.Errorf("apply environment %s override: %s", env, err)
-	}
-	return &LoadBalancedWebService{
-		wkld: &wkld{
-			name:   aws.StringValue(mft.Name),
-			env:    env,
-			app:    app,
-			tc:     envManifest.TaskConfig,
-			rc:     rc,
-			image:  envManifest.ImageConfig,
-			parser: parser,
-			addons: addons,
-		},
-		manifest:     envManifest,
-		httpsEnabled: false,
+// LoadBalancedWebServiceOption is used to configuring an optional field for LoadBalancedWebService.
+type LoadBalancedWebServiceOption func(s *LoadBalancedWebService)
 
-		parser: parser,
-	}, nil
+// WithImportedALB specifies an imported load balancer.
+func WithImportedALB(alb *elbv2.LoadBalancer) func(s *LoadBalancedWebService) {
+	return func(s *LoadBalancedWebService) {
+		s.importedALB = alb
+	}
 }
 
-// NewHTTPSLoadBalancedWebService  creates a new LoadBalancedWebService stack from its manifest that needs to be deployed to
-// a environment within an application. It creates an HTTPS listener and assumes that the environment
-// it's being deployed into has an HTTPS configured listener.
-func NewHTTPSLoadBalancedWebService(mft *manifest.LoadBalancedWebService, env, app string, rc RuntimeConfig) (*LoadBalancedWebService, error) {
-	webSvc, err := NewLoadBalancedWebService(mft, env, app, rc)
+// LoadBalancedWebServiceConfig contains fields to configure LoadBalancedWebService.
+type LoadBalancedWebServiceConfig struct {
+	App                *config.Application
+	EnvManifest        *manifest.Environment
+	Manifest           *manifest.LoadBalancedWebService
+	RawManifest        string
+	RuntimeConfig      RuntimeConfig
+	RootUserARN        string
+	ArtifactBucketName string
+	ArtifactKey        string
+	Addons             NestedStackConfigurer
+}
+
+// NewLoadBalancedWebService creates a new CFN stack with an ECS service from a manifest file, given the options.
+func NewLoadBalancedWebService(conf LoadBalancedWebServiceConfig,
+	opts ...LoadBalancedWebServiceOption) (*LoadBalancedWebService, error) {
+	crs, err := customresource.LBWS(fs)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load balanced web service custom resources: %w", err)
 	}
-	webSvc.httpsEnabled = true
-	return webSvc, nil
+	conf.RuntimeConfig.loadCustomResourceURLs(conf.ArtifactBucketName, uploadableCRs(crs).convert())
+
+	var dnsDelegationEnabled, httpsEnabled bool
+	var appInfo deploy.AppInformation
+	if conf.App.Domain != "" {
+		dnsDelegationEnabled = true
+		appInfo = deploy.AppInformation{
+			Name:                conf.App.Name,
+			Domain:              conf.App.Domain,
+			AccountPrincipalARN: conf.RootUserARN,
+		}
+		httpsEnabled = true
+	}
+	certImported := len(conf.EnvManifest.HTTPConfig.Public.Certificates) != 0
+	if certImported {
+		httpsEnabled = true
+		dnsDelegationEnabled = false
+	}
+	if conf.Manifest.HTTPOrBool.Disabled() {
+		httpsEnabled = false
+	}
+	s := &LoadBalancedWebService{
+		ecsWkld: &ecsWkld{
+			wkld: &wkld{
+				name:               aws.StringValue(conf.Manifest.Name),
+				env:                aws.StringValue(conf.EnvManifest.Name),
+				app:                conf.App.Name,
+				permBound:          conf.App.PermissionsBoundary,
+				artifactBucketName: conf.ArtifactBucketName,
+				artifactKey:        conf.ArtifactKey,
+				rc:                 conf.RuntimeConfig,
+				image:              conf.Manifest.ImageConfig.Image,
+				rawManifest:        conf.RawManifest,
+				parser:             fs,
+				addons:             conf.Addons,
+			},
+			logging:             conf.Manifest.Logging,
+			sidecars:            conf.Manifest.Sidecars,
+			tc:                  conf.Manifest.TaskConfig,
+			taskDefOverrideFunc: override.CloudFormationTemplate,
+		},
+		manifest:             conf.Manifest,
+		httpsEnabled:         httpsEnabled,
+		appInfo:              appInfo,
+		dnsDelegationEnabled: dnsDelegationEnabled,
+
+		parser: fs,
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s, nil
 }
 
 // Template returns the CloudFormation template for the service parametrized for the environment.
 func (s *LoadBalancedWebService) Template() (string, error) {
-	rulePriorityLambda, err := s.parser.Read(lbWebSvcRulePriorityGeneratorPath)
-	if err != nil {
-		return "", fmt.Errorf("read rule priority lambda: %w", err)
-	}
-	desiredCountLambda, err := s.parser.Read(desiredCountGeneratorPath)
-	if err != nil {
-		return "", fmt.Errorf("read desired count lambda: %w", err)
-	}
-	envControllerLambda, err := s.parser.Read(envControllerPath)
-	if err != nil {
-		return "", fmt.Errorf("read env controller lambda: %w", err)
-	}
-	outputs, err := s.addonsOutputs()
+	crs, err := convertCustomResources(s.rc.CustomResourcesURL)
 	if err != nil {
 		return "", err
 	}
-	sidecars, err := s.manifest.Sidecar.Options()
+	addonsParams, err := s.addonsParameters()
+	if err != nil {
+		return "", err
+	}
+	addonsOutputs, err := s.addonsOutputs()
+	if err != nil {
+		return "", err
+	}
+
+	exposedPorts, err := s.manifest.ExposedPorts()
+	if err != nil {
+		return "", fmt.Errorf("parse exposed ports in service manifest %s: %w", s.name, err)
+	}
+	sidecars, err := convertSidecars(s.manifest.Sidecars, exposedPorts.PortsForContainer, s.rc)
 	if err != nil {
 		return "", fmt.Errorf("convert the sidecar configuration for service %s: %w", s.name, err)
 	}
-	autoscaling, err := s.manifest.Count.Autoscaling.Options()
+	publishers, err := convertPublish(s.manifest.Publish(), s.rc.AccountID, s.rc.Region, s.app, s.env, s.name)
 	if err != nil {
-		return "", fmt.Errorf("convert the Auto Scaling configuration for service %s: %w", s.name, err)
+		return "", fmt.Errorf(`convert "publish" field for service %s: %w`, s.name, err)
 	}
+
+	advancedCount, err := convertAdvancedCount(s.manifest.Count.AdvancedCount)
+	if err != nil {
+		return "", fmt.Errorf("convert the advanced count configuration for service %s: %w", s.name, err)
+	}
+
+	var autoscaling *template.AutoscalingOpts
+	var desiredCountOnSpot *int
+	var capacityProviders []*template.CapacityProviderStrategy
+
+	if advancedCount != nil {
+		autoscaling = advancedCount.Autoscaling
+		desiredCountOnSpot = advancedCount.Spot
+		capacityProviders = advancedCount.Cps
+	}
+
+	entrypoint, err := convertEntryPoint(s.manifest.EntryPoint)
+	if err != nil {
+		return "", err
+	}
+	command, err := convertCommand(s.manifest.Command)
+	if err != nil {
+		return "", err
+	}
+	nlbConfig, err := s.convertNetworkLoadBalancer()
+	if err != nil {
+		return "", err
+	}
+	albListenerConfig, err := s.convertALBListener()
+	if err != nil {
+		return "", err
+	}
+	importedALBConfig, err := s.convertImportedALB()
+	if err != nil {
+		return "", err
+	}
+	scTarget := s.manifest.ServiceConnectTarget(exposedPorts)
+	scOpts := template.ServiceConnectOpts{
+		Server: convertServiceConnectServer(s.manifest.Network.Connect, scTarget),
+		Client: s.manifest.Network.Connect.Enabled(),
+	}
+
+	// Set container-level feature flag.
+	logConfig := convertLogging(s.manifest.Logging)
 	content, err := s.parser.ParseLoadBalancedWebService(template.WorkloadOpts{
-		Variables:           s.manifest.Variables,
-		Secrets:             s.manifest.Secrets,
-		NestedStack:         outputs,
-		Sidecars:            sidecars,
-		LogConfig:           s.manifest.LogConfigOpts(),
-		Autoscaling:         autoscaling,
-		HTTPHealthCheck:     s.manifest.HealthCheck.HTTPHealthCheckOpts(),
-		AllowedSourceIps:    s.manifest.AllowedSourceIps,
-		RulePriorityLambda:  rulePriorityLambda.String(),
-		DesiredCountLambda:  desiredCountLambda.String(),
-		EnvControllerLambda: envControllerLambda.String(),
+		// Workload parameters.
+		AppName:            s.app,
+		EnvName:            s.env,
+		EnvVersion:         s.rc.EnvVersion,
+		Version:            s.rc.Version,
+		SerializedManifest: string(s.rawManifest),
+		WorkloadName:       s.name,
+		WorkloadType:       manifestinfo.LoadBalancedWebServiceType,
+
+		// Configuration for the main container.
+		Command:      command,
+		EntryPoint:   entrypoint,
+		HealthCheck:  convertContainerHealthCheck(s.manifest.ImageConfig.HealthCheck),
+		PortMappings: convertPortMappings(exposedPorts.PortsForContainer[s.name]),
+		Secrets:      convertSecrets(s.manifest.TaskConfig.Secrets),
+		Variables:    convertEnvVars(s.manifest.TaskConfig.Variables),
+
+		// Additional options that are common between **all** workload templates.
+		AddonsExtraParams:       addonsParams,
+		Autoscaling:             autoscaling,
+		CapacityProviders:       capacityProviders,
+		CredentialsParameter:    aws.StringValue(s.manifest.ImageConfig.Image.Credentials),
+		DesiredCountOnSpot:      desiredCountOnSpot,
+		DeploymentConfiguration: convertDeploymentConfig(s.manifest.DeployConfig),
+		DependsOn:               convertDependsOn(s.manifest.ImageConfig.Image.DependsOn),
+		DockerLabels:            s.manifest.ImageConfig.Image.DockerLabels,
+		ExecuteCommand:          convertExecuteCommand(&s.manifest.ExecuteCommand),
+		LogConfig:               logConfig,
+		NestedStack:             addonsOutputs,
+		Network:                 convertNetworkConfig(s.manifest.Network),
+		Publish:                 publishers,
+		PermissionsBoundary:     s.permBound,
+		Platform:                convertPlatform(s.manifest.Platform),
+		Storage:                 convertStorageOpts(s.manifest.Name, s.manifest.Storage),
+
+		// ALB configs.
+		ALBEnabled:  !s.manifest.HTTPOrBool.Disabled(),
+		GracePeriod: s.convertGracePeriod(),
+		ALBListener: albListenerConfig,
+		ImportedALB: importedALBConfig,
+
+		// NLB configs.
+		AppDNSName:           nlbConfig.appDNSName,
+		AppDNSDelegationRole: nlbConfig.appDNSDelegationRole,
+		NLB:                  nlbConfig.settings,
+
+		// service connect and service discovery options.
+		ServiceConnectOpts:       scOpts,
+		ServiceDiscoveryEndpoint: s.rc.ServiceDiscoveryEndpoint,
+
+		// Additional options for request driven web service templates.
+		Observability: template.ObservabilityOpts{
+			Tracing: strings.ToUpper(aws.StringValue(s.manifest.Observability.Tracing)),
+		},
+
+		// Sidecar configs.
+		Sidecars: sidecars,
+
+		// Custom Resource Config.
+		CustomResources: crs,
 	})
 	if err != nil {
 		return "", err
 	}
-	return content.String(), nil
-}
-
-func (s *LoadBalancedWebService) loadBalancerTarget() (targetContainer *string, targetPort *string, err error) {
-	containerName := s.name
-	containerPort := strconv.FormatUint(uint64(aws.Uint16Value(s.manifest.ImageConfig.Port)), 10)
-	// Route load balancer traffic to main container by default.
-	targetContainer = aws.String(containerName)
-	targetPort = aws.String(containerPort)
-	if s.manifest.TargetContainer == nil && s.manifest.TargetContainerCamelCase != nil {
-		s.manifest.TargetContainer = s.manifest.TargetContainerCamelCase
+	overriddenTpl, err := s.taskDefOverrideFunc(convertTaskDefOverrideRules(s.manifest.TaskDefOverrides), content.Bytes())
+	if err != nil {
+		return "", fmt.Errorf("apply task definition overrides: %w", err)
 	}
-	mftTargetContainer := s.manifest.TargetContainer
-	if mftTargetContainer != nil {
-		sidecar, ok := s.manifest.Sidecars[*mftTargetContainer]
-		if ok {
-			targetContainer = mftTargetContainer
-			targetPort = sidecar.Port
-		} else {
-			return nil, nil, fmt.Errorf("target container %s doesn't exist", *s.manifest.TargetContainer)
-		}
-	}
-	return
+	return string(overriddenTpl), nil
 }
 
 // Parameters returns the list of CloudFormation parameters used by the template.
 func (s *LoadBalancedWebService) Parameters() ([]*cloudformation.Parameter, error) {
-	wkldParams, err := s.wkld.Parameters()
+	wkldParams, err := s.ecsWkld.Parameters()
 	if err != nil {
 		return nil, err
 	}
-	targetContainer, targetPort, err := s.loadBalancerTarget()
+	exposedPorts, err := s.manifest.ExposedPorts()
+	if err != nil {
+		return nil, fmt.Errorf("parse exposed ports in service manifest %s: %w", s.name, err)
+	}
+	targetContainer, targetPort, err := s.manifest.HTTPOrBool.Main.Target(exposedPorts)
 	if err != nil {
 		return nil, err
 	}
-	return append(wkldParams, []*cloudformation.Parameter{
+	wkldParams = append(wkldParams, []*cloudformation.Parameter{
 		{
-			ParameterKey:   aws.String(LBWebServiceContainerPortParamKey),
-			ParameterValue: aws.String(strconv.FormatUint(uint64(aws.Uint16Value(s.manifest.ImageConfig.Port)), 10)),
+			ParameterKey:   aws.String(WorkloadContainerPortParamKey),
+			ParameterValue: aws.String(s.manifest.MainContainerPort()),
 		},
 		{
-			ParameterKey:   aws.String(LBWebServiceRulePathParamKey),
-			ParameterValue: s.manifest.Path,
+			ParameterKey:   aws.String(LBWebServiceDNSDelegatedParamKey),
+			ParameterValue: aws.String(strconv.FormatBool(s.dnsDelegationEnabled)),
 		},
 		{
-			ParameterKey:   aws.String(LBWebServiceHTTPSParamKey),
-			ParameterValue: aws.String(strconv.FormatBool(s.httpsEnabled)),
+			ParameterKey:   aws.String(WorkloadTargetContainerParamKey),
+			ParameterValue: aws.String(targetContainer),
 		},
 		{
-			ParameterKey:   aws.String(LBWebServiceTargetContainerParamKey),
-			ParameterValue: targetContainer,
+			ParameterKey:   aws.String(WorkloadTargetPortParamKey),
+			ParameterValue: aws.String(targetPort),
 		},
-		{
-			ParameterKey:   aws.String(LBWebServiceTargetPortParamKey),
-			ParameterValue: targetPort,
-		},
-		{
-			ParameterKey:   aws.String(LBWebServiceStickinessParamKey),
-			ParameterValue: aws.String(strconv.FormatBool(aws.BoolValue(s.manifest.Stickiness))),
-		},
-	}...), nil
+	}...)
+
+	if !s.manifest.HTTPOrBool.Disabled() {
+		wkldParams = append(wkldParams, []*cloudformation.Parameter{
+			{
+				ParameterKey:   aws.String(WorkloadRulePathParamKey),
+				ParameterValue: s.manifest.HTTPOrBool.Main.Path,
+			},
+			{
+				ParameterKey:   aws.String(WorkloadHTTPSParamKey),
+				ParameterValue: aws.String(strconv.FormatBool(s.httpsEnabled)),
+			},
+		}...)
+	}
+	if !s.manifest.NLBConfig.IsEmpty() {
+		port, _, err := manifest.ParsePortMapping(s.manifest.NLBConfig.Listener.Port)
+		if err != nil {
+			return nil, err
+		}
+		wkldParams = append(wkldParams, []*cloudformation.Parameter{
+			{
+				ParameterKey:   aws.String(LBWebServiceNLBAliasesParamKey),
+				ParameterValue: aws.String(s.manifest.NLBConfig.Aliases.ToString()),
+			},
+			{
+				ParameterKey:   aws.String(LBWebServiceNLBPortParamKey),
+				ParameterValue: port,
+			},
+		}...)
+	}
+	return wkldParams, nil
 }
 
-// SerializedParameters returns the CloudFormation stack's parameters serialized
-// to a YAML document annotated with comments for readability to users.
+// SerializedParameters returns the CloudFormation stack's parameters serialized to a JSON document.
 func (s *LoadBalancedWebService) SerializedParameters() (string, error) {
-	return s.wkld.templateConfiguration(s)
+	return serializeTemplateConfig(s.wkld.parser, s)
 }

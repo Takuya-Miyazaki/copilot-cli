@@ -19,7 +19,7 @@ import (
 
 const (
 	defaultGHBranch = "main"
-	defaultCCBranch = "master"
+	defaultCCBranch = "main"
 )
 
 func TestNewProvider(t *testing.T) {
@@ -62,7 +62,7 @@ func TestNewPipelineManifest(t *testing.T) {
 		provider    Provider
 		inputStages []PipelineStage
 
-		expectedManifest *PipelineManifest
+		expectedManifest *Pipeline
 		expectedErr      error
 	}{
 		"errors out when no stage provided": {
@@ -96,7 +96,7 @@ func TestNewPipelineManifest(t *testing.T) {
 					RequiresApproval: true,
 				},
 			},
-			expectedManifest: &PipelineManifest{
+			expectedManifest: &Pipeline{
 				Name:    "pipepiper",
 				Version: Ver1,
 				Source: &Source{
@@ -127,7 +127,7 @@ func TestNewPipelineManifest(t *testing.T) {
 			require.NoError(t, err)
 
 			// WHEN
-			m, err := NewPipelineManifest(pipelineName, tc.provider, tc.inputStages)
+			m, err := NewPipeline(pipelineName, tc.provider, tc.inputStages)
 
 			// THEN
 			if tc.expectedErr != nil {
@@ -143,13 +143,13 @@ func TestNewPipelineManifest(t *testing.T) {
 
 func TestPipelineManifest_MarshalBinary(t *testing.T) {
 	testCases := map[string]struct {
-		mockDependencies func(ctrl *gomock.Controller, manifest *PipelineManifest)
+		mockDependencies func(ctrl *gomock.Controller, manifest *Pipeline)
 
 		wantedBinary []byte
 		wantedError  error
 	}{
 		"error parsing template": {
-			mockDependencies: func(ctrl *gomock.Controller, manifest *PipelineManifest) {
+			mockDependencies: func(ctrl *gomock.Controller, manifest *Pipeline) {
 				m := mocks.NewMockParser(ctrl)
 				manifest.parser = m
 				m.EXPECT().Parse(pipelineManifestPath, *manifest).Return(nil, errors.New("some error"))
@@ -158,7 +158,7 @@ func TestPipelineManifest_MarshalBinary(t *testing.T) {
 			wantedError: errors.New("some error"),
 		},
 		"returns rendered content": {
-			mockDependencies: func(ctrl *gomock.Controller, manifest *PipelineManifest) {
+			mockDependencies: func(ctrl *gomock.Controller, manifest *Pipeline) {
 				m := mocks.NewMockParser(ctrl)
 				manifest.parser = m
 				m.EXPECT().Parse(pipelineManifestPath, *manifest).Return(&template.Content{Buffer: bytes.NewBufferString("hello")}, nil)
@@ -174,7 +174,7 @@ func TestPipelineManifest_MarshalBinary(t *testing.T) {
 			// GIVEN
 			ctrl := gomock.NewController(t)
 			defer ctrl.Finish()
-			manifest := &PipelineManifest{}
+			manifest := &Pipeline{}
 			tc.mockDependencies(ctrl, manifest)
 
 			// WHEN
@@ -190,7 +190,7 @@ func TestPipelineManifest_MarshalBinary(t *testing.T) {
 func TestUnmarshalPipeline(t *testing.T) {
 	testCases := map[string]struct {
 		inContent        string
-		expectedManifest *PipelineManifest
+		expectedManifest *Pipeline
 		expectedErr      error
 	}{
 		"invalid pipeline schema version": {
@@ -211,14 +211,14 @@ stages:
       name: prod
 `,
 			expectedErr: &ErrInvalidPipelineManifestVersion{
-				PipelineSchemaMajorVersion(-1),
+				invalidVersion: PipelineSchemaMajorVersion(-1),
 			},
 		},
 		"invalid pipeline.yml": {
 			inContent:   `corrupted yaml`,
-			expectedErr: errors.New("yaml: unmarshal errors:\n  line 1: cannot unmarshal !!str `corrupt...` into manifest.PipelineManifest"),
+			expectedErr: errors.New("yaml: unmarshal errors:\n  line 1: cannot unmarshal !!str `corrupt...` into manifest.Pipeline"),
 		},
-		"valid pipeline.yml": {
+		"valid pipeline.yml without build": {
 			inContent: `
 name: pipepiper
 version: 1
@@ -238,7 +238,7 @@ stages:
       name: wings
       test_commands: []
 `,
-			expectedManifest: &PipelineManifest{
+			expectedManifest: &Pipeline{
 				Name:    "pipepiper",
 				Version: Ver1,
 				Source: &Source{
@@ -256,6 +256,48 @@ stages:
 					},
 					{
 						Name:         "wings",
+						TestCommands: []string{},
+					},
+				},
+			},
+		},
+		"valid pipeline.yml with build": {
+			inContent: `
+name: pipepiper
+version: 1
+
+source:
+  provider: GitHub
+  properties:
+    repository: aws/somethingCool
+    access_token_secret: "github-token-badgoose-backend"
+    branch: main
+
+build:
+  image: aws/codebuild/standard:3.0
+
+stages:
+    -
+      name: chicken
+      test_commands: []
+`,
+			expectedManifest: &Pipeline{
+				Name:    "pipepiper",
+				Version: Ver1,
+				Source: &Source{
+					ProviderName: "GitHub",
+					Properties: map[string]interface{}{
+						"access_token_secret": "github-token-badgoose-backend",
+						"repository":          "aws/somethingCool",
+						"branch":              defaultGHBranch,
+					},
+				},
+				Build: &Build{
+					Image: "aws/codebuild/standard:3.0",
+				},
+				Stages: []PipelineStage{
+					{
+						Name:         "chicken",
 						TestCommands: []string{},
 					},
 				},

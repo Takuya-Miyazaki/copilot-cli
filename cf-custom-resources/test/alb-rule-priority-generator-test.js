@@ -3,12 +3,15 @@
 "use strict";
 
 describe("ALB Rule Priority Generator", () => {
-  const AWS = require("aws-sdk-mock");
+  const elbv2 = require("@aws-sdk/client-elastic-load-balancing-v2");
+  const { mockClient } = require('aws-sdk-client-mock');
   const LambdaTester = require("lambda-tester").noVersionCheck();
   const sinon = require("sinon");
   const albRulePriorityHandler = require("../lib/alb-rule-priority-generator");
   const nock = require("nock");
   const ResponseURL = "https://cloudwatch-response-mock.example.com/";
+  const LogGroup = "/aws/lambda/testLambda";
+  const LogStream = "2021/06/28/[$LATEST]9b93a7dca7344adeb193d15c092dbbfd";
 
   let origLog = console.log;
 
@@ -18,28 +21,16 @@ describe("ALB Rule Priority Generator", () => {
 
   beforeEach(() => {
     albRulePriorityHandler.withDefaultResponseURL(ResponseURL);
+    albRulePriorityHandler.withDefaultLogGroup(LogGroup);
+    albRulePriorityHandler.withDefaultLogStream(LogStream);
     console.log = function () {};
+    elbv2Mock.reset();
   });
   afterEach(() => {
-    AWS.restore();
     console.log = origLog;
   });
 
-  test("Empty event payload fails", () => {
-    const request = nock(ResponseURL)
-      .put("/", (body) => {
-        return (
-          body.Status === "FAILED" &&
-          body.Reason === "Unsupported request type undefined"
-        );
-      })
-      .reply(200);
-    return LambdaTester(albRulePriorityHandler.nextAvailableRulePriorityHandler)
-      .event({})
-      .expectResolve(() => {
-        expect(request.isDone()).toBe(true);
-      });
-  });
+  const elbv2Mock = mockClient(elbv2.ElasticLoadBalancingV2Client);
 
   test("Bogus operation fails", () => {
     const bogusType = "bogus";
@@ -47,13 +38,17 @@ describe("ALB Rule Priority Generator", () => {
       .put("/", (body) => {
         return (
           body.Status === "FAILED" &&
-          body.Reason === "Unsupported request type " + bogusType
+          body.Reason ===
+            "Unsupported request type bogus (Log: /aws/lambda/testLambda/2021/06/28/[$LATEST]9b93a7dca7344adeb193d15c092dbbfd)"
         );
       })
       .reply(200);
     return LambdaTester(albRulePriorityHandler.nextAvailableRulePriorityHandler)
       .event({
         RequestType: bogusType,
+        RequestId: testRequestId,
+        ResourceProperties: {},
+        LogicalResourceId: "mockID",
       })
       .expectResolve(() => {
         expect(request.isDone()).toBe(true);
@@ -65,7 +60,7 @@ describe("ALB Rule Priority Generator", () => {
       Rules: [],
     });
 
-    AWS.mock("ELBv2", "describeRules", describeRulesFake);
+   elbv2Mock.on(elbv2.DescribeRulesCommand).callsFake(describeRulesFake);
 
     const requestType = "Delete";
     const request = nock(ResponseURL)
@@ -76,6 +71,9 @@ describe("ALB Rule Priority Generator", () => {
     return LambdaTester(albRulePriorityHandler.nextAvailableRulePriorityHandler)
       .event({
         RequestType: requestType,
+        RequestId: testRequestId,
+        ResourceProperties: {},
+        LogicalResourceId: "mockID",
       })
       .expectResolve(() => {
         sinon.assert.notCalled(describeRulesFake);
@@ -83,30 +81,7 @@ describe("ALB Rule Priority Generator", () => {
       });
   });
 
-  test("Update event is a no-op", () => {
-    const describeRulesFake = sinon.fake.resolves({
-      Rules: [],
-    });
-
-    AWS.mock("ELBv2", "describeRules", describeRulesFake);
-
-    const requestType = "Update";
-    const request = nock(ResponseURL)
-      .put("/", (body) => {
-        return body.Status === "SUCCESS";
-      })
-      .reply(200);
-    return LambdaTester(albRulePriorityHandler.nextAvailableRulePriorityHandler)
-      .event({
-        RequestType: requestType,
-      })
-      .expectResolve(() => {
-        sinon.assert.notCalled(describeRulesFake);
-        expect(request.isDone()).toBe(true);
-      });
-  });
-
-  test("Create operation returns rule priority 1 when only the default rule is present", () => {
+  test("Create operation returns non-root rule priority 1 when only the default rule is present", () => {
     const describeRulesFake = sinon.fake.resolves({
       Rules: [
         {
@@ -126,10 +101,14 @@ describe("ALB Rule Priority Generator", () => {
       ],
     });
 
-    AWS.mock("ELBv2", "describeRules", describeRulesFake);
+    elbv2Mock.on(elbv2.DescribeRulesCommand).callsFake(describeRulesFake);
     const request = nock(ResponseURL)
       .put("/", (body) => {
-        return body.Status === "SUCCESS" && body.Data.Priority == 1;
+        return (
+          body.Status === "SUCCESS" &&
+          body.Data.Priority == 1 &&
+          body.PhysicalResourceId === "alb-rule-priority-mockID"
+        );
       })
       .reply(200);
 
@@ -139,7 +118,9 @@ describe("ALB Rule Priority Generator", () => {
         RequestId: testRequestId,
         ResourceProperties: {
           ListenerArn: testALBListenerArn,
+          RulePath: ["/api"],
         },
+        LogicalResourceId: "mockID",
       })
       .expectResolve(() => {
         sinon.assert.calledWith(
@@ -152,7 +133,59 @@ describe("ALB Rule Priority Generator", () => {
       });
   });
 
-  test("Create operation returns rule priority 1 when the MAX rule is present", () => {
+  test("Update operation returns root rule priority 50000 when only the default rule is present", () => {
+    const describeRulesFake = sinon.fake.resolves({
+      Rules: [
+        {
+          Priority: "default",
+          Conditions: [],
+          RuleArn:
+            "arn:aws:elasticloadbalancing:us-west-2:000000000:listener-rule/app/rule",
+          IsDefault: true,
+          Actions: [
+            {
+              TargetGroupArn:
+                "arn:aws:elasticloadbalancing:us-west-2:000000000:targetgroup/tg",
+              Type: "forward",
+            },
+          ],
+        },
+      ],
+    });
+
+    elbv2Mock.on(elbv2.DescribeRulesCommand).callsFake(describeRulesFake);
+    const request = nock(ResponseURL)
+      .put("/", (body) => {
+        return (
+          body.Status === "SUCCESS" &&
+          body.Data.Priority == 50000 &&
+          body.PhysicalResourceId === "alb-rule-priority-mockID"
+        );
+      })
+      .reply(200);
+
+    return LambdaTester(albRulePriorityHandler.nextAvailableRulePriorityHandler)
+      .event({
+        RequestType: "Update",
+        RequestId: testRequestId,
+        ResourceProperties: {
+          ListenerArn: testALBListenerArn,
+          RulePath: ["/"],
+        },
+        LogicalResourceId: "mockID",
+      })
+      .expectResolve(() => {
+        sinon.assert.calledWith(
+          describeRulesFake,
+          sinon.match({
+            ListenerArn: testALBListenerArn,
+          })
+        );
+        expect(request.isDone()).toBe(true);
+      });
+  });
+
+  test("Create operation returns non-root rule priority 1 when any root rule is present", () => {
     const describeRulesFake = sinon.fake.resolves({
       Rules: [
         {
@@ -172,7 +205,7 @@ describe("ALB Rule Priority Generator", () => {
       ],
     });
 
-    AWS.mock("ELBv2", "describeRules", describeRulesFake);
+    elbv2Mock.on(elbv2.DescribeRulesCommand).callsFake(describeRulesFake);
     const request = nock(ResponseURL)
       .put("/", (body) => {
         return body.Status === "SUCCESS" && body.Data.Priority == 1;
@@ -185,6 +218,7 @@ describe("ALB Rule Priority Generator", () => {
         RequestId: testRequestId,
         ResourceProperties: {
           ListenerArn: testALBListenerArn,
+          RulePath: ["/api"],
         },
       })
       .expectResolve(() => {
@@ -198,7 +232,7 @@ describe("ALB Rule Priority Generator", () => {
       });
   });
 
-  test("Create operation returns rule priority max + 1", () => {
+  test("Create operation returns non-root rule priority max + 1", () => {
     // This set of rules has the default, 3 and 5 rule priorities. We don't try to fill
     // in the gaps, we just create one that is 1 + the max. In this case, 6.
     const describeRulesFake = sinon.fake.resolves({
@@ -248,7 +282,7 @@ describe("ALB Rule Priority Generator", () => {
       ],
     });
 
-    AWS.mock("ELBv2", "describeRules", describeRulesFake);
+    elbv2Mock.on(elbv2.DescribeRulesCommand).callsFake(describeRulesFake);
     const request = nock(ResponseURL)
       .put("/", (body) => {
         return body.Status === "SUCCESS" && body.Data.Priority == 6;
@@ -261,6 +295,7 @@ describe("ALB Rule Priority Generator", () => {
         RequestId: testRequestId,
         ResourceProperties: {
           ListenerArn: testALBListenerArn,
+          RulePath: ["/api"],
         },
       })
       .expectResolve(() => {
@@ -274,7 +309,82 @@ describe("ALB Rule Priority Generator", () => {
       });
   });
 
-  test("Create operation returns rule priority max + 1 for paginated response", () => {
+  test("Create operation returns root rule priority min - 1", () => {
+    const describeRulesFake = sinon.fake.resolves({
+      Rules: [
+        {
+          Priority: "default",
+          Conditions: [],
+          RuleArn:
+            "arn:aws:elasticloadbalancing:us-west-2:000000000:listener-rule/app/rule",
+          IsDefault: true,
+          Actions: [
+            {
+              TargetGroupArn:
+                "arn:aws:elasticloadbalancing:us-west-2:000000000:targetgroup/tg",
+              Type: "forward",
+            },
+          ],
+        },
+        {
+          Priority: "49999",
+          Conditions: [],
+          RuleArn:
+            "arn:aws:elasticloadbalancing:us-west-2:000000000:listener-rule/app/rule",
+          IsDefault: true,
+          Actions: [
+            {
+              TargetGroupArn:
+                "arn:aws:elasticloadbalancing:us-west-2:000000000:targetgroup/tg",
+              Type: "forward",
+            },
+          ],
+        },
+        {
+          Priority: "50000",
+          Conditions: [],
+          RuleArn:
+            "arn:aws:elasticloadbalancing:us-west-2:000000000:listener-rule/app/rule",
+          IsDefault: true,
+          Actions: [
+            {
+              TargetGroupArn:
+                "arn:aws:elasticloadbalancing:us-west-2:000000000:targetgroup/tg",
+              Type: "forward",
+            },
+          ],
+        },
+      ],
+    });
+
+    elbv2Mock.on(elbv2.DescribeRulesCommand).callsFake(describeRulesFake);
+    const request = nock(ResponseURL)
+      .put("/", (body) => {
+        return body.Status === "SUCCESS" && body.Data.Priority == 49998;
+      })
+      .reply(200);
+
+    return LambdaTester(albRulePriorityHandler.nextAvailableRulePriorityHandler)
+      .event({
+        RequestType: "Create",
+        RequestId: testRequestId,
+        ResourceProperties: {
+          ListenerArn: testALBListenerArn,
+          RulePath: ["/"],
+        },
+      })
+      .expectResolve(() => {
+        sinon.assert.calledWith(
+          describeRulesFake,
+          sinon.match({
+            ListenerArn: testALBListenerArn,
+          })
+        );
+        expect(request.isDone()).toBe(true);
+      });
+  });
+
+  test("Create operation returns non-root rule priority max + 1 for paginated response", () => {
     // This set of rules has the default, 3 and 5 rule priorities. We don't try to fill
     // in the gaps, we just create one that is 1 + the max. In this case, 6.
     const describeRulesFake = sinon.stub();
@@ -315,10 +425,24 @@ describe("ALB Rule Priority Generator", () => {
             },
           ],
         },
+        {
+          Priority: "48000",
+          Conditions: [],
+          RuleArn:
+            "arn:aws:elasticloadbalancing:us-west-2:000000000:listener-rule/app/rule",
+          IsDefault: true,
+          Actions: [
+            {
+              TargetGroupArn:
+                "arn:aws:elasticloadbalancing:us-west-2:000000000:targetgroup/tg",
+              Type: "forward",
+            },
+          ],
+        },
       ],
     });
 
-    AWS.mock("ELBv2", "describeRules", describeRulesFake);
+    elbv2Mock.on(elbv2.DescribeRulesCommand).callsFake(describeRulesFake);
     const request = nock(ResponseURL)
       .put("/", (body) => {
         return body.Status === "SUCCESS" && body.Data.Priority == 101;
@@ -331,6 +455,7 @@ describe("ALB Rule Priority Generator", () => {
         RequestId: testRequestId,
         ResourceProperties: {
           ListenerArn: testALBListenerArn,
+          RulePath: ["/api"],
         },
       })
       .expectResolve(() => {
@@ -352,4 +477,84 @@ describe("ALB Rule Priority Generator", () => {
         expect(request.isDone()).toBe(true);
       });
   });
+  test("Create operation returns non-root rule priority max + number of rules in case of multiple ports", () => {
+    // This set of rules has the default, 3 and 5 rule priorities. We don't try to fill
+    // in the gaps, we just create one that is 1 + the max. In this case, 6.
+    const describeRulesFake = sinon.fake.resolves({
+      Rules: [
+        {
+          Priority: "default",
+          Conditions: [],
+          RuleArn:
+              "arn:aws:elasticloadbalancing:us-west-2:000000000:listener-rule/app/rule",
+          IsDefault: true,
+          Actions: [
+            {
+              TargetGroupArn:
+                  "arn:aws:elasticloadbalancing:us-west-2:000000000:targetgroup/tg",
+              Type: "forward",
+            },
+          ],
+        },
+        {
+          Priority: "3",
+          Conditions: [],
+          RuleArn:
+              "arn:aws:elasticloadbalancing:us-west-2:000000000:listener-rule/app/rule",
+          IsDefault: true,
+          Actions: [
+            {
+              TargetGroupArn:
+                  "arn:aws:elasticloadbalancing:us-west-2:000000000:targetgroup/tg",
+              Type: "forward",
+            },
+          ],
+        },
+        {
+          Priority: "5",
+          Conditions: [],
+          RuleArn:
+              "arn:aws:elasticloadbalancing:us-west-2:000000000:listener-rule/app/rule",
+          IsDefault: true,
+          Actions: [
+            {
+              TargetGroupArn:
+                  "arn:aws:elasticloadbalancing:us-west-2:000000000:targetgroup/tg",
+              Type: "forward",
+            },
+          ],
+        },
+      ],
+    });
+
+    elbv2Mock.on(elbv2.DescribeRulesCommand).callsFake(describeRulesFake);
+    const request = nock(ResponseURL)
+        .put("/", (body) => {
+          return body.Status === "SUCCESS" &&
+              body.Data.Priority == 6 &&
+              body.Data.Priority2 == 7 &&
+              body.Data.Priority1 == 50000;
+        })
+        .reply(200);
+
+    return LambdaTester(albRulePriorityHandler.nextAvailableRulePriorityHandler)
+        .event({
+          RequestType: "Create",
+          RequestId: testRequestId,
+          ResourceProperties: {
+            ListenerArn: testALBListenerArn,
+            RulePath: ["/api", "/", "admin"],
+          },
+        })
+        .expectResolve(() => {
+          sinon.assert.calledWith(
+              describeRulesFake,
+              sinon.match({
+                ListenerArn: testALBListenerArn,
+              })
+          );
+          expect(request.isDone()).toBe(true);
+        });
+  });
+
 });

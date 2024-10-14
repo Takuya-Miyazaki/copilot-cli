@@ -9,11 +9,11 @@ import (
 	"strings"
 
 	"github.com/aws/copilot-cli/e2e/internal/client"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
-var _ = Describe("init flow", func() {
+var _ = Describe("init flow", Ordered, func() {
 
 	var (
 		svcName    string
@@ -27,6 +27,7 @@ var _ = Describe("init flow", func() {
 		_, initErr = cli.Init(&client.InitRequest{
 			AppName:      appName,
 			WorkloadName: svcName,
+			EnvName:      envName,
 			ImageTag:     "gallopinggurdey",
 			Dockerfile:   "./front-end/Dockerfile",
 			WorkloadType: "Load Balanced Web Service",
@@ -37,6 +38,7 @@ var _ = Describe("init flow", func() {
 		_, jobInitErr = cli.Init(&client.InitRequest{
 			AppName:      appName,
 			WorkloadName: jobName,
+			EnvName:      envName,
 			ImageTag:     "thepostalservice",
 			Dockerfile:   "./mailer/Dockerfile",
 			WorkloadType: "Scheduled Job",
@@ -55,7 +57,7 @@ var _ = Describe("init flow", func() {
 		})
 	})
 
-	Context("svc ls", func() {
+	Context("svc ls", Ordered, func() {
 		var (
 			svcList      *client.SvcListOutput
 			svcListError error
@@ -77,7 +79,7 @@ var _ = Describe("init flow", func() {
 
 	})
 
-	Context("job ls", func() {
+	Context("job ls", Ordered, func() {
 		var (
 			jobList    *client.JobListOutput
 			jobListErr error
@@ -98,7 +100,7 @@ var _ = Describe("init flow", func() {
 		})
 	})
 
-	Context("svc show", func() {
+	Context("svc show", Ordered, func() {
 		var (
 			svc        *client.SvcShowOutput
 			svcShowErr error
@@ -109,7 +111,6 @@ var _ = Describe("init flow", func() {
 				AppName: appName,
 				Name:    svcName,
 			})
-
 		})
 
 		It("should not return an error", func() {
@@ -123,7 +124,7 @@ var _ = Describe("init flow", func() {
 
 		It("should return a valid route", func() {
 			Expect(len(svc.Routes)).To(Equal(1))
-			Expect(svc.Routes[0].Environment).To(Equal("test"))
+			Expect(svc.Routes[0].Environment).To(Equal("dev"))
 			Eventually(func() (int, error) {
 				resp, fetchErr := http.Get(svc.Routes[0].URL)
 				return resp.StatusCode, fetchErr
@@ -132,18 +133,18 @@ var _ = Describe("init flow", func() {
 
 		It("should return a valid service discovery namespace", func() {
 			Expect(len(svc.ServiceDiscoveries)).To(Equal(1))
-			Expect(svc.ServiceDiscoveries[0].Environment).To(Equal([]string{"test"}))
-			Expect(svc.ServiceDiscoveries[0].Namespace).To(Equal(fmt.Sprintf("%s.%s.local:80", svcName, appName)))
+			Expect(svc.ServiceDiscoveries[0].Environment).To(Equal([]string{"dev"}))
+			Expect(svc.ServiceDiscoveries[0].Endpoint).To(Equal(fmt.Sprintf("%s.%s.%s.local:80", svcName, envName, appName)))
 		})
 
 		It("should return the correct environment variables", func() {
 			Expect(len(svc.Variables)).To(Equal(5))
 			expectedVars := map[string]string{
 				"COPILOT_APPLICATION_NAME":           appName,
-				"COPILOT_ENVIRONMENT_NAME":           "test",
+				"COPILOT_ENVIRONMENT_NAME":           "dev",
 				"COPILOT_LB_DNS":                     strings.TrimPrefix(svc.Routes[0].URL, "http://"),
 				"COPILOT_SERVICE_NAME":               svcName,
-				"COPILOT_SERVICE_DISCOVERY_ENDPOINT": fmt.Sprintf("%s.local", appName),
+				"COPILOT_SERVICE_DISCOVERY_ENDPOINT": fmt.Sprintf("%s.%s.local", envName, appName),
 			}
 			for _, variable := range svc.Variables {
 				Expect(variable.Value).To(Equal(expectedVars[variable.Name]))
@@ -152,7 +153,6 @@ var _ = Describe("init flow", func() {
 	})
 
 	Context("svc logs", func() {
-
 		It("should return valid log lines", func() {
 			var svcLogs []client.SvcLogsOutput
 			var svcLogsErr error
@@ -160,7 +160,7 @@ var _ = Describe("init flow", func() {
 				svcLogs, svcLogsErr = cli.SvcLogs(&client.SvcLogsRequest{
 					AppName: appName,
 					Name:    svcName,
-					EnvName: "test",
+					EnvName: "dev",
 					Since:   "1h",
 				})
 				return svcLogs, svcLogsErr
@@ -172,6 +172,34 @@ var _ = Describe("init flow", func() {
 				Expect(logLine.Timestamp).NotTo(Equal(0))
 				Expect(logLine.IngestionTime).NotTo(Equal(0))
 			}
+		})
+	})
+
+	Context("force a new svc deploy", Ordered, func() {
+		var err error
+		BeforeAll(func() {
+			_, err = cli.SvcDeploy(&client.SvcDeployInput{
+				Name:     svcName,
+				EnvName:  "dev",
+				Force:    true,
+				ImageTag: "gallopinggurdey",
+			})
+		})
+		It("should not return an error", func() {
+			Expect(err).NotTo(HaveOccurred())
+		})
+		It("should return a valid route", func() {
+			svc, svcShowErr := cli.SvcShow(&client.SvcShowRequest{
+				AppName: appName,
+				Name:    svcName,
+			})
+			Expect(svcShowErr).NotTo(HaveOccurred())
+			Expect(len(svc.Routes)).To(Equal(1))
+			Expect(svc.Routes[0].Environment).To(Equal("dev"))
+			Eventually(func() (int, error) {
+				resp, fetchErr := http.Get(svc.Routes[0].URL)
+				return resp.StatusCode, fetchErr
+			}, "30s", "1s").Should(Equal(200))
 		})
 	})
 })

@@ -6,84 +6,89 @@ package cli
 import (
 	"errors"
 	"fmt"
-	"path/filepath"
+	"strings"
 	"testing"
 
-	addon "github.com/aws/copilot-cli/internal/pkg/addon"
-	"github.com/aws/copilot-cli/internal/pkg/config"
-	"github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation/stack"
-	"github.com/aws/copilot-cli/internal/pkg/exec"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/copilot-cli/internal/pkg/aws/cloudformation"
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
+	"github.com/aws/copilot-cli/internal/pkg/template"
+	"github.com/aws/copilot-cli/internal/pkg/version"
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 
+	clideploy "github.com/aws/copilot-cli/internal/pkg/cli/deploy"
 	"github.com/aws/copilot-cli/internal/pkg/cli/mocks"
+	"github.com/aws/copilot-cli/internal/pkg/config"
 )
 
-type deploySvcMocks struct {
-	mockWs                 *mocks.MockwsSvcDirReader
-	mockimageBuilderPusher *mocks.MockimageBuilderPusher
+func TestSvcDeployOpts_Validate(t *testing.T) {
+	// There is no validation for svc deploy.
 }
 
-func TestSvcDeployOpts_Validate(t *testing.T) {
+type svcDeployAskMocks struct {
+	store *mocks.Mockstore
+	sel   *mocks.MockwsSelector
+	ws    *mocks.MockwsWlDirReader
+}
+
+func TestSvcDeployOpts_Ask(t *testing.T) {
 	testCases := map[string]struct {
 		inAppName string
 		inEnvName string
 		inSvcName string
 
-		mockWs    func(m *mocks.MockwsSvcDirReader)
-		mockStore func(m *mocks.Mockstore)
+		setupMocks func(m *svcDeployAskMocks)
 
-		wantedError error
+		wantedSvcName string
+		wantedEnvName string
+		wantedError   error
 	}{
-		"no existing applications": {
-			mockWs:    func(m *mocks.MockwsSvcDirReader) {},
-			mockStore: func(m *mocks.Mockstore) {},
-
+		"validate instead of prompting application name, svc name and environment name": {
+			inAppName: "phonetool",
+			inEnvName: "prod-iad",
+			inSvcName: "frontend",
+			setupMocks: func(m *svcDeployAskMocks) {
+				m.store.EXPECT().GetApplication("phonetool")
+				m.store.EXPECT().GetEnvironment("phonetool", "prod-iad").Return(&config.Environment{Name: "prod-iad"}, nil)
+				m.ws.EXPECT().ListServices().Return([]string{"frontend"}, nil)
+				m.store.EXPECT().GetService("phonetool", "frontend").Return(&config.Workload{}, nil)
+				m.sel.EXPECT().Service(gomock.Any(), gomock.Any()).Times(0)
+				m.sel.EXPECT().Environment(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+			},
+			wantedSvcName: "frontend",
+			wantedEnvName: "prod-iad",
+		},
+		"error instead of prompting for application name if not provided": {
+			setupMocks: func(m *svcDeployAskMocks) {
+				m.store.EXPECT().GetApplication(gomock.Any()).Times(0)
+			},
 			wantedError: errNoAppInWorkspace,
 		},
-		"with workspace error": {
+		"prompt for service name": {
+			inAppName: "phonetool",
+			inEnvName: "prod-iad",
+			setupMocks: func(m *svcDeployAskMocks) {
+				m.sel.EXPECT().Service("Select a service in your workspace", "").Return("frontend", nil)
+				m.store.EXPECT().GetApplication(gomock.Any()).Times(1)
+				m.store.EXPECT().GetEnvironment("phonetool", "prod-iad").Return(&config.Environment{Name: "prod-iad"}, nil)
+				m.store.EXPECT().GetService("phonetool", "frontend").Return(&config.Workload{}, nil)
+			},
+			wantedSvcName: "frontend",
+			wantedEnvName: "prod-iad",
+		},
+		"prompt for environment name": {
 			inAppName: "phonetool",
 			inSvcName: "frontend",
-			mockWs: func(m *mocks.MockwsSvcDirReader) {
-				m.EXPECT().ServiceNames().Return(nil, errors.New("some error"))
+			setupMocks: func(m *svcDeployAskMocks) {
+				m.sel.EXPECT().Environment(gomock.Any(), gomock.Any(), "phonetool").Return("prod-iad", nil)
+				m.store.EXPECT().GetApplication("phonetool")
+				m.ws.EXPECT().ListServices().Return([]string{"frontend"}, nil)
+				m.store.EXPECT().GetService("phonetool", "frontend").Return(&config.Workload{}, nil)
 			},
-			mockStore: func(m *mocks.Mockstore) {},
-
-			wantedError: errors.New("list services in the workspace: some error"),
-		},
-		"with service not in workspace": {
-			inAppName: "phonetool",
-			inSvcName: "frontend",
-			mockWs: func(m *mocks.MockwsSvcDirReader) {
-				m.EXPECT().ServiceNames().Return([]string{}, nil)
-			},
-			mockStore: func(m *mocks.Mockstore) {},
-
-			wantedError: errors.New("service frontend not found in the workspace"),
-		},
-		"with unknown environment": {
-			inAppName: "phonetool",
-			inEnvName: "test",
-			mockWs:    func(m *mocks.MockwsSvcDirReader) {},
-			mockStore: func(m *mocks.Mockstore) {
-				m.EXPECT().GetEnvironment("phonetool", "test").
-					Return(nil, errors.New("unknown env"))
-			},
-
-			wantedError: errors.New("get environment test configuration: unknown env"),
-		},
-		"successful validation": {
-			inAppName: "phonetool",
-			inSvcName: "frontend",
-			inEnvName: "test",
-			mockWs: func(m *mocks.MockwsSvcDirReader) {
-				m.EXPECT().ServiceNames().Return([]string{"frontend"}, nil)
-			},
-			mockStore: func(m *mocks.Mockstore) {
-				m.EXPECT().GetEnvironment("phonetool", "test").
-					Return(&config.Environment{Name: "test"}, nil)
-			},
+			wantedSvcName: "frontend",
+			wantedEnvName: "prod-iad",
 		},
 	}
 
@@ -93,91 +98,21 @@ func TestSvcDeployOpts_Validate(t *testing.T) {
 			ctrl := gomock.NewController(t)
 			defer ctrl.Finish()
 
-			mockWs := mocks.NewMockwsSvcDirReader(ctrl)
-			mockStore := mocks.NewMockstore(ctrl)
-			tc.mockWs(mockWs)
-			tc.mockStore(mockStore)
+			m := &svcDeployAskMocks{
+				store: mocks.NewMockstore(ctrl),
+				sel:   mocks.NewMockwsSelector(ctrl),
+				ws:    mocks.NewMockwsWlDirReader(ctrl),
+			}
+			tc.setupMocks(m)
 			opts := deploySvcOpts{
 				deployWkldVars: deployWkldVars{
 					appName: tc.inAppName,
 					name:    tc.inSvcName,
 					envName: tc.inEnvName,
 				},
-				ws:    mockWs,
-				store: mockStore,
-			}
-
-			// WHEN
-			err := opts.Validate()
-
-			// THEN
-			if tc.wantedError != nil {
-				require.EqualError(t, err, tc.wantedError.Error())
-			} else {
-				require.NoError(t, err)
-			}
-		})
-	}
-}
-
-func TestSvcDeployOpts_Ask(t *testing.T) {
-	testCases := map[string]struct {
-		inAppName  string
-		inEnvName  string
-		inSvcName  string
-		inImageTag string
-
-		wantedCalls func(m *mocks.MockwsSelector)
-
-		wantedSvcName  string
-		wantedEnvName  string
-		wantedImageTag string
-		wantedError    error
-	}{
-		"prompts for environment name and service names": {
-			inAppName:  "phonetool",
-			inImageTag: "latest",
-			wantedCalls: func(m *mocks.MockwsSelector) {
-				m.EXPECT().Service("Select a service in your workspace", "").Return("frontend", nil)
-				m.EXPECT().Environment("Select an environment", "", "phonetool").Return("prod-iad", nil)
-			},
-
-			wantedSvcName:  "frontend",
-			wantedEnvName:  "prod-iad",
-			wantedImageTag: "latest",
-		},
-		"don't call selector if flags are provided": {
-			inAppName:  "phonetool",
-			inEnvName:  "prod-iad",
-			inSvcName:  "frontend",
-			inImageTag: "latest",
-			wantedCalls: func(m *mocks.MockwsSelector) {
-				m.EXPECT().Service(gomock.Any(), gomock.Any()).Times(0)
-				m.EXPECT().Environment(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
-			},
-
-			wantedSvcName:  "frontend",
-			wantedEnvName:  "prod-iad",
-			wantedImageTag: "latest",
-		},
-	}
-
-	for name, tc := range testCases {
-		t.Run(name, func(t *testing.T) {
-			// GIVEN
-			ctrl := gomock.NewController(t)
-			defer ctrl.Finish()
-			mockSel := mocks.NewMockwsSelector(ctrl)
-
-			tc.wantedCalls(mockSel)
-			opts := deploySvcOpts{
-				deployWkldVars: deployWkldVars{
-					appName:  tc.inAppName,
-					name:     tc.inSvcName,
-					envName:  tc.inEnvName,
-					imageTag: tc.inImageTag,
-				},
-				sel: mockSel,
+				sel:   m.sel,
+				store: m.store,
+				ws:    m.ws,
 			}
 
 			// WHEN
@@ -188,7 +123,6 @@ func TestSvcDeployOpts_Ask(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, tc.wantedSvcName, opts.name)
 				require.Equal(t, tc.wantedEnvName, opts.envName)
-				require.Equal(t, tc.wantedImageTag, opts.imageTag)
 			} else {
 				require.EqualError(t, err, tc.wantedError.Error())
 			}
@@ -196,299 +130,518 @@ func TestSvcDeployOpts_Ask(t *testing.T) {
 	}
 }
 
-func TestSvcDeployOpts_configureContainerImage(t *testing.T) {
-	mockError := errors.New("mockError")
-	mockManifest := []byte(`name: serviceA
-type: 'Load Balanced Web Service'
-image:
-  build:
-    dockerfile: path/to/Dockerfile
-    context: path
-`)
-	mockMftNoBuild := []byte(`name: serviceA
-type: 'Load Balanced Web Service'
-image:
-  location: foo/bar
-`)
-	mockMftBuildString := []byte(`name: serviceA
-type: 'Load Balanced Web Service'
-image:
-  build: path/to/Dockerfile
-`)
-	mockMftNoContext := []byte(`name: serviceA
-type: 'Load Balanced Web Service'
-image:
-  build:
-    dockerfile: path/to/Dockerfile`)
+type deployMocks struct {
+	mockDeployer             *mocks.MockworkloadDeployer
+	mockInterpolator         *mocks.Mockinterpolator
+	mockWsReader             *mocks.MockwsWlDirReader
+	mockEnvFeaturesDescriber *mocks.MockversionCompatibilityChecker
+	mockMft                  *mockWorkloadMft
+	mockDiffWriter           *strings.Builder
+	mockPrompter             *mocks.Mockprompter
+	mockVersionGetter        *mocks.MockversionGetter
+}
 
-	tests := map[string]struct {
-		inputSvc   string
-		setupMocks func(mocks deploySvcMocks)
-
-		wantErr error
+func TestSvcDeployOpts_Execute(t *testing.T) {
+	const (
+		mockAppName      = "phonetool"
+		mockSvcName      = "frontend"
+		mockEnvName      = "prod-iad"
+		mockVersion      = "v1.29.0"
+		mockNewerVersion = "v1.30.0"
+	)
+	mockError := errors.New("some error")
+	mockErrStackNotFound := cloudformation.ErrStackNotFound{}
+	testCases := map[string]struct {
+		inShowDiff       bool
+		inSkipDiffPrompt bool
+		inForceFlag      bool
+		inAllowDowngrade bool
+		inSvcType        string
+		mock             func(m *deployMocks)
+		wantedDiff       string
+		wantedError      error
 	}{
-		"should return error if ws ReadFile returns error": {
-			inputSvc: "serviceA",
-			setupMocks: func(m deploySvcMocks) {
-				gomock.InOrder(
-					m.mockWs.EXPECT().ReadServiceManifest("serviceA").Return(nil, mockError),
-				)
+		"error out if fail to get version": {
+			mock: func(m *deployMocks) {
+				m.mockVersionGetter.EXPECT().Version().Return("", mockError)
 			},
-			wantErr: fmt.Errorf("read service %s manifest file: %w", "serviceA", mockError),
+
+			wantedError: fmt.Errorf("get template version of workload frontend: some error"),
 		},
-		"should return error if workspace methods fail": {
-			inputSvc: "serviceA",
-			setupMocks: func(m deploySvcMocks) {
-				gomock.InOrder(
-					m.mockWs.EXPECT().ReadServiceManifest(gomock.Any()).Return(mockManifest, nil),
-					m.mockWs.EXPECT().CopilotDirPath().Return("", mockError),
-				)
+		"error out if try to downgrade service version without flag": {
+			mock: func(m *deployMocks) {
+				m.mockVersionGetter.EXPECT().Version().Return(mockNewerVersion, nil)
 			},
-			wantErr: fmt.Errorf("get copilot directory: %w", mockError),
+
+			wantedError: fmt.Errorf(`cannot downgrade workload "frontend" (currently in version v1.30.0) to version v1.29.0`),
 		},
-		"success without building and pushing": {
-			inputSvc: "serviceA",
-			setupMocks: func(m deploySvcMocks) {
-				gomock.InOrder(
-					m.mockWs.EXPECT().ReadServiceManifest("serviceA").Return(mockMftNoBuild, nil),
-					m.mockWs.EXPECT().CopilotDirPath().Times(0),
-					m.mockimageBuilderPusher.EXPECT().BuildAndPush(gomock.Any(), gomock.Any()).Times(0),
-				)
+		"error out if fail to read workload manifest": {
+			mock: func(m *deployMocks) {
+				m.mockVersionGetter.EXPECT().Version().Return(mockVersion, nil)
+				m.mockWsReader.EXPECT().ReadWorkloadManifest(mockSvcName).Return(nil, mockError)
+			},
+
+			wantedError: fmt.Errorf("read manifest file for frontend: some error"),
+		},
+		"error out if fail to interpolate workload manifest": {
+			mock: func(m *deployMocks) {
+				m.mockVersionGetter.EXPECT().Version().Return(mockVersion, nil)
+				m.mockWsReader.EXPECT().ReadWorkloadManifest(mockSvcName).Return([]byte(""), nil)
+				m.mockInterpolator.EXPECT().Interpolate("").Return("", mockError)
+			},
+
+			wantedError: fmt.Errorf("interpolate environment variables for frontend manifest: some error"),
+		},
+		"error if fail to get a list of available features from the environment": {
+			mock: func(m *deployMocks) {
+				m.mockVersionGetter.EXPECT().Version().Return(mockVersion, nil)
+				m.mockWsReader.EXPECT().ReadWorkloadManifest(mockSvcName).Return([]byte(""), nil)
+				m.mockInterpolator.EXPECT().Interpolate("").Return("", nil)
+				m.mockEnvFeaturesDescriber.EXPECT().Version().Return("v1.mock", nil)
+				m.mockEnvFeaturesDescriber.EXPECT().AvailableFeatures().Return(nil, mockError)
+			},
+
+			wantedError: fmt.Errorf("get available features of the prod-iad environment stack: some error"),
+		},
+		"error out if force deploy for static site service": {
+			inForceFlag: true,
+			inSvcType:   manifestinfo.StaticSiteType,
+			mock: func(m *deployMocks) {
+				m.mockVersionGetter.EXPECT().Version().Return(mockVersion, nil)
+				m.mockWsReader.EXPECT().ReadWorkloadManifest(mockSvcName).Return([]byte(""), nil)
+				m.mockInterpolator.EXPECT().Interpolate("").Return("", nil)
+			},
+
+			wantedError: fmt.Errorf(`--force is not supported for service type "Static Site"`),
+		},
+		"error if some required features are not available in the environment": {
+			mock: func(m *deployMocks) {
+				m.mockVersionGetter.EXPECT().Version().Return(mockVersion, nil)
+				m.mockWsReader.EXPECT().ReadWorkloadManifest(mockSvcName).Return([]byte(""), nil)
+				m.mockInterpolator.EXPECT().Interpolate("").Return("", nil)
+				m.mockMft = &mockWorkloadMft{
+					mockRequiredEnvironmentFeatures: func() []string {
+						return []string{"mockFeature1", "mockFeature3"}
+					},
+				}
+				m.mockEnvFeaturesDescriber.EXPECT().Version().Return("v1.mock", nil)
+				m.mockEnvFeaturesDescriber.EXPECT().AvailableFeatures().Return([]string{"mockFeature1", "mockFeature2"}, nil)
+			},
+
+			wantedError: fmt.Errorf(`environment "prod-iad" is on version "v1.mock" which does not support the "mockFeature3" feature`),
+		},
+		"error if failed to upload artifacts": {
+			mock: func(m *deployMocks) {
+				m.mockVersionGetter.EXPECT().Version().Return(mockVersion, nil)
+				m.mockWsReader.EXPECT().ReadWorkloadManifest(mockSvcName).Return([]byte(""), nil)
+				m.mockInterpolator.EXPECT().Interpolate("").Return("", nil)
+				m.mockMft = &mockWorkloadMft{
+					mockRequiredEnvironmentFeatures: func() []string {
+						return []string{"mockFeature1"}
+					},
+				}
+				m.mockEnvFeaturesDescriber.EXPECT().Version().Return("v1.mock", nil)
+				m.mockEnvFeaturesDescriber.EXPECT().AvailableFeatures().Return([]string{"mockFeature1", "mockFeature2"}, nil)
+				m.mockDeployer.EXPECT().IsServiceAvailableInRegion("").Return(false, nil)
+				m.mockDeployer.EXPECT().UploadArtifacts().Return(nil, mockError)
+			},
+
+			wantedError: fmt.Errorf("upload deploy resources for service frontend: some error"),
+		},
+		"error if failed to generate the template to show diff": {
+			inShowDiff: true,
+			mock: func(m *deployMocks) {
+				m.mockVersionGetter.EXPECT().Version().Return(mockVersion, nil)
+				m.mockWsReader.EXPECT().ReadWorkloadManifest(mockSvcName).Return([]byte(""), nil)
+				m.mockInterpolator.EXPECT().Interpolate("").Return("", nil)
+				m.mockMft = &mockWorkloadMft{
+					mockRequiredEnvironmentFeatures: func() []string {
+						return []string{"mockFeature1"}
+					},
+				}
+				m.mockEnvFeaturesDescriber.EXPECT().Version().Return("v1.mock", nil)
+				m.mockEnvFeaturesDescriber.EXPECT().AvailableFeatures().Return([]string{"mockFeature1", "mockFeature2"}, nil)
+				m.mockDeployer.EXPECT().IsServiceAvailableInRegion("").Return(false, nil)
+				m.mockDeployer.EXPECT().UploadArtifacts().Return(&clideploy.UploadArtifactsOutput{}, nil)
+				m.mockDeployer.EXPECT().GenerateCloudFormationTemplate(gomock.Any()).Return(nil, errors.New("some error"))
+			},
+			wantedError: fmt.Errorf("generate the template for workload %q against environment %q: some error", mockSvcName, mockEnvName),
+		},
+		"error if failed to generate the diff": {
+			inShowDiff: true,
+			mock: func(m *deployMocks) {
+				m.mockVersionGetter.EXPECT().Version().Return(mockVersion, nil)
+				m.mockWsReader.EXPECT().ReadWorkloadManifest(mockSvcName).Return([]byte(""), nil)
+				m.mockInterpolator.EXPECT().Interpolate("").Return("", nil)
+				m.mockMft = &mockWorkloadMft{
+					mockRequiredEnvironmentFeatures: func() []string {
+						return []string{"mockFeature1"}
+					},
+				}
+				m.mockEnvFeaturesDescriber.EXPECT().Version().Return("v1.mock", nil)
+				m.mockEnvFeaturesDescriber.EXPECT().AvailableFeatures().Return([]string{"mockFeature1", "mockFeature2"}, nil)
+				m.mockDeployer.EXPECT().IsServiceAvailableInRegion("").Return(false, nil)
+				m.mockDeployer.EXPECT().UploadArtifacts().Return(&clideploy.UploadArtifactsOutput{}, nil)
+				m.mockDeployer.EXPECT().GenerateCloudFormationTemplate(gomock.Any()).Return(&clideploy.GenerateCloudFormationTemplateOutput{}, nil)
+				m.mockDeployer.EXPECT().DeployDiff(gomock.Any()).Return("", errors.New("some error"))
+			},
+			wantedError: errors.New("some error"),
+		},
+		"write 'no changes' if there is no diff": {
+			inShowDiff: true,
+			mock: func(m *deployMocks) {
+				m.mockVersionGetter.EXPECT().Version().Return(mockVersion, nil)
+				m.mockWsReader.EXPECT().ReadWorkloadManifest(mockSvcName).Return([]byte(""), nil)
+				m.mockInterpolator.EXPECT().Interpolate("").Return("", nil)
+				m.mockMft = &mockWorkloadMft{
+					mockRequiredEnvironmentFeatures: func() []string {
+						return []string{"mockFeature1"}
+					},
+				}
+				m.mockEnvFeaturesDescriber.EXPECT().Version().Return("v1.mock", nil)
+				m.mockEnvFeaturesDescriber.EXPECT().AvailableFeatures().Return([]string{"mockFeature1", "mockFeature2"}, nil)
+				m.mockDeployer.EXPECT().IsServiceAvailableInRegion("").Return(false, nil)
+				m.mockDeployer.EXPECT().UploadArtifacts().Return(&clideploy.UploadArtifactsOutput{}, nil)
+				m.mockDeployer.EXPECT().GenerateCloudFormationTemplate(gomock.Any()).Return(&clideploy.GenerateCloudFormationTemplateOutput{}, nil)
+				m.mockDeployer.EXPECT().DeployDiff(gomock.Any()).Return("", nil)
+				m.mockDiffWriter = &strings.Builder{}
+				m.mockPrompter.EXPECT().Confirm(gomock.Eq("Continue with the deployment?"), gomock.Any(), gomock.Any()).Return(false, nil)
+			},
+			wantedDiff: "No changes.\n",
+		},
+		"write the correct diff": {
+			inShowDiff: true,
+			mock: func(m *deployMocks) {
+				m.mockVersionGetter.EXPECT().Version().Return(mockVersion, nil)
+				m.mockWsReader.EXPECT().ReadWorkloadManifest(mockSvcName).Return([]byte(""), nil)
+				m.mockInterpolator.EXPECT().Interpolate("").Return("", nil)
+				m.mockMft = &mockWorkloadMft{
+					mockRequiredEnvironmentFeatures: func() []string {
+						return []string{"mockFeature1"}
+					},
+				}
+				m.mockEnvFeaturesDescriber.EXPECT().Version().Return("v1.mock", nil)
+				m.mockEnvFeaturesDescriber.EXPECT().AvailableFeatures().Return([]string{"mockFeature1", "mockFeature2"}, nil)
+				m.mockDeployer.EXPECT().IsServiceAvailableInRegion("").Return(false, nil)
+				m.mockDeployer.EXPECT().UploadArtifacts().Return(&clideploy.UploadArtifactsOutput{}, nil)
+				m.mockDeployer.EXPECT().GenerateCloudFormationTemplate(gomock.Any()).Return(&clideploy.GenerateCloudFormationTemplateOutput{}, nil)
+				m.mockDeployer.EXPECT().DeployDiff(gomock.Any()).Return("mock diff", nil)
+				m.mockDiffWriter = &strings.Builder{}
+				m.mockPrompter.EXPECT().Confirm(gomock.Eq("Continue with the deployment?"), gomock.Any(), gomock.Any()).Return(false, nil)
+			},
+			wantedDiff: "mock diff",
+		},
+		"error if fail to ask whether to continue the deployment": {
+			inShowDiff: true,
+			mock: func(m *deployMocks) {
+				m.mockVersionGetter.EXPECT().Version().Return(mockVersion, nil)
+				m.mockWsReader.EXPECT().ReadWorkloadManifest(mockSvcName).Return([]byte(""), nil)
+				m.mockInterpolator.EXPECT().Interpolate("").Return("", nil)
+				m.mockMft = &mockWorkloadMft{
+					mockRequiredEnvironmentFeatures: func() []string {
+						return []string{"mockFeature1"}
+					},
+				}
+				m.mockEnvFeaturesDescriber.EXPECT().Version().Return("v1.mock", nil)
+				m.mockEnvFeaturesDescriber.EXPECT().AvailableFeatures().Return([]string{"mockFeature1", "mockFeature2"}, nil)
+				m.mockDeployer.EXPECT().IsServiceAvailableInRegion("").Return(false, nil)
+				m.mockDeployer.EXPECT().UploadArtifacts().Return(&clideploy.UploadArtifactsOutput{}, nil)
+				m.mockDeployer.EXPECT().GenerateCloudFormationTemplate(gomock.Any()).Return(&clideploy.GenerateCloudFormationTemplateOutput{}, nil)
+				m.mockDeployer.EXPECT().DeployDiff(gomock.Any()).Return("mock diff", nil)
+				m.mockDiffWriter = &strings.Builder{}
+				m.mockPrompter.EXPECT().Confirm(gomock.Eq("Continue with the deployment?"), gomock.Any(), gomock.Any()).Return(false, errors.New("some error"))
+			},
+			wantedError: errors.New("ask whether to continue with the deployment: some error"),
+		},
+		"do not deploy if asked to": {
+			inShowDiff: true,
+			mock: func(m *deployMocks) {
+				m.mockVersionGetter.EXPECT().Version().Return(mockVersion, nil)
+				m.mockWsReader.EXPECT().ReadWorkloadManifest(mockSvcName).Return([]byte(""), nil)
+				m.mockInterpolator.EXPECT().Interpolate("").Return("", nil)
+				m.mockMft = &mockWorkloadMft{
+					mockRequiredEnvironmentFeatures: func() []string {
+						return []string{"mockFeature1"}
+					},
+				}
+				m.mockEnvFeaturesDescriber.EXPECT().Version().Return("v1.mock", nil)
+				m.mockEnvFeaturesDescriber.EXPECT().AvailableFeatures().Return([]string{"mockFeature1", "mockFeature2"}, nil)
+				m.mockDeployer.EXPECT().IsServiceAvailableInRegion("").Return(false, nil)
+				m.mockDeployer.EXPECT().UploadArtifacts().Return(&clideploy.UploadArtifactsOutput{}, nil)
+				m.mockDeployer.EXPECT().GenerateCloudFormationTemplate(gomock.Any()).Return(&clideploy.GenerateCloudFormationTemplateOutput{}, nil)
+				m.mockDeployer.EXPECT().DeployDiff(gomock.Any()).Return("mock diff", nil)
+				m.mockDiffWriter = &strings.Builder{}
+				m.mockPrompter.EXPECT().Confirm(gomock.Eq("Continue with the deployment?"), gomock.Any(), gomock.Any()).Return(false, nil)
+				m.mockDeployer.EXPECT().DeployWorkload(gomock.Any()).Times(0)
 			},
 		},
-		"should return error if fail to build and push": {
-			inputSvc: "serviceA",
-			setupMocks: func(m deploySvcMocks) {
-				gomock.InOrder(
-					m.mockWs.EXPECT().ReadServiceManifest("serviceA").Return(mockManifest, nil),
-					m.mockWs.EXPECT().CopilotDirPath().Return("/ws/root/copilot", nil),
-					m.mockimageBuilderPusher.EXPECT().BuildAndPush(gomock.Any(), gomock.Any()).Return(mockError),
-				)
-			},
-			wantErr: fmt.Errorf("build and push image: mockError"),
-		},
-		"success": {
-			inputSvc: "serviceA",
-			setupMocks: func(m deploySvcMocks) {
-				gomock.InOrder(
-					m.mockWs.EXPECT().ReadServiceManifest("serviceA").Return(mockManifest, nil),
-					m.mockWs.EXPECT().CopilotDirPath().Return("/ws/root/copilot", nil),
-					m.mockimageBuilderPusher.EXPECT().BuildAndPush(gomock.Any(), &exec.BuildArguments{
-						Dockerfile: filepath.Join("/ws", "root", "path", "to", "Dockerfile"),
-						Context:    filepath.Join("/ws", "root", "path"),
-					}).Return(nil),
-				)
+		"deploy if asked to": {
+			inShowDiff: true,
+			mock: func(m *deployMocks) {
+				m.mockVersionGetter.EXPECT().Version().Return(mockVersion, nil)
+				m.mockWsReader.EXPECT().ReadWorkloadManifest(mockSvcName).Return([]byte(""), nil)
+				m.mockInterpolator.EXPECT().Interpolate("").Return("", nil)
+				m.mockMft = &mockWorkloadMft{
+					mockRequiredEnvironmentFeatures: func() []string {
+						return []string{"mockFeature1"}
+					},
+				}
+				m.mockEnvFeaturesDescriber.EXPECT().Version().Return("v1.mock", nil)
+				m.mockEnvFeaturesDescriber.EXPECT().AvailableFeatures().Return([]string{"mockFeature1", "mockFeature2"}, nil)
+				m.mockDeployer.EXPECT().IsServiceAvailableInRegion("").Return(false, nil)
+				m.mockDeployer.EXPECT().UploadArtifacts().Return(&clideploy.UploadArtifactsOutput{}, nil)
+				m.mockDeployer.EXPECT().GenerateCloudFormationTemplate(gomock.Any()).Return(&clideploy.GenerateCloudFormationTemplateOutput{}, nil)
+				m.mockDeployer.EXPECT().DeployDiff(gomock.Any()).Return("mock diff", nil)
+				m.mockDiffWriter = &strings.Builder{}
+				m.mockPrompter.EXPECT().Confirm(gomock.Eq("Continue with the deployment?"), gomock.Any(), gomock.Any()).Return(true, nil)
+				m.mockDeployer.EXPECT().DeployWorkload(gomock.Any()).Times(1)
 			},
 		},
-		"using simple buildstring (backwards compatible)": {
-			inputSvc: "serviceA",
-			setupMocks: func(m deploySvcMocks) {
-				gomock.InOrder(
-					m.mockWs.EXPECT().ReadServiceManifest("serviceA").Return(mockMftBuildString, nil),
-					m.mockWs.EXPECT().CopilotDirPath().Return("/ws/root/copilot", nil),
-					m.mockimageBuilderPusher.EXPECT().BuildAndPush(gomock.Any(), &exec.BuildArguments{
-						Dockerfile: filepath.Join("/ws", "root", "path", "to", "Dockerfile"),
-						Context:    filepath.Join("/ws", "root", "path", "to"),
-					}).Return(nil),
-				)
+		"skip prompt and deploy immediately after diff": {
+			inShowDiff:       true,
+			inSkipDiffPrompt: true,
+			mock: func(m *deployMocks) {
+				m.mockVersionGetter.EXPECT().Version().Return(mockVersion, nil)
+				m.mockWsReader.EXPECT().ReadWorkloadManifest(mockSvcName).Return([]byte(""), nil)
+				m.mockInterpolator.EXPECT().Interpolate("").Return("", nil)
+				m.mockMft = &mockWorkloadMft{
+					mockRequiredEnvironmentFeatures: func() []string {
+						return []string{"mockFeature1"}
+					},
+				}
+				m.mockEnvFeaturesDescriber.EXPECT().Version().Return("v1.mock", nil)
+				m.mockEnvFeaturesDescriber.EXPECT().AvailableFeatures().Return([]string{"mockFeature1", "mockFeature2"}, nil)
+				m.mockDeployer.EXPECT().IsServiceAvailableInRegion("").Return(false, nil)
+				m.mockDeployer.EXPECT().UploadArtifacts().Return(&clideploy.UploadArtifactsOutput{}, nil)
+				m.mockDeployer.EXPECT().GenerateCloudFormationTemplate(gomock.Any()).Return(&clideploy.GenerateCloudFormationTemplateOutput{}, nil)
+				m.mockDeployer.EXPECT().DeployDiff(gomock.Any()).Return("mock diff", nil)
+				m.mockDiffWriter = &strings.Builder{}
+				m.mockPrompter.EXPECT().Confirm(gomock.Eq("Continue with the deployment?"), gomock.Any(), gomock.Any()).Times(0)
+				m.mockDeployer.EXPECT().DeployWorkload(gomock.Any()).Times(1)
 			},
 		},
-		"without context field in overrides": {
-			inputSvc: "serviceA",
-			setupMocks: func(m deploySvcMocks) {
-				gomock.InOrder(
-					m.mockWs.EXPECT().ReadServiceManifest("serviceA").Return(mockMftNoContext, nil),
-					m.mockWs.EXPECT().CopilotDirPath().Return("/ws/root/copilot", nil),
-					m.mockimageBuilderPusher.EXPECT().BuildAndPush(gomock.Any(), &exec.BuildArguments{
-						Dockerfile: filepath.Join("/ws", "root", "path", "to", "Dockerfile"),
-						Context:    filepath.Join("/ws", "root", "path", "to"),
-					}).Return(nil),
-				)
+		"error if failed to deploy service": {
+			mock: func(m *deployMocks) {
+				m.mockVersionGetter.EXPECT().Version().Return(mockVersion, nil)
+				m.mockWsReader.EXPECT().ReadWorkloadManifest(mockSvcName).Return([]byte(""), nil)
+				m.mockInterpolator.EXPECT().Interpolate("").Return("", nil)
+				m.mockMft = &mockWorkloadMft{
+					mockRequiredEnvironmentFeatures: func() []string {
+						return []string{"mockFeature1"}
+					},
+				}
+				m.mockEnvFeaturesDescriber.EXPECT().Version().Return("v1.mock", nil)
+				m.mockEnvFeaturesDescriber.EXPECT().AvailableFeatures().Return([]string{"mockFeature1", "mockFeature2"}, nil)
+				m.mockDeployer.EXPECT().UploadArtifacts().Return(&clideploy.UploadArtifactsOutput{}, nil)
+				m.mockDeployer.EXPECT().DeployWorkload(gomock.Any()).Return(nil, mockError)
+				m.mockDeployer.EXPECT().IsServiceAvailableInRegion("").Return(false, nil)
+			},
+
+			wantedError: fmt.Errorf("deploy service frontend to environment prod-iad: some error"),
+		},
+		"success with no recommendations and allow downgrade": {
+			inAllowDowngrade: true,
+			mock: func(m *deployMocks) {
+				m.mockVersionGetter.EXPECT().Version().Times(0)
+				m.mockWsReader.EXPECT().ReadWorkloadManifest(mockSvcName).Return([]byte(""), nil)
+				m.mockInterpolator.EXPECT().Interpolate("").Return("", nil)
+				m.mockMft = &mockWorkloadMft{
+					mockRequiredEnvironmentFeatures: func() []string {
+						return []string{"mockFeature1"}
+					},
+				}
+				m.mockEnvFeaturesDescriber.EXPECT().Version().Return("v1.mock", nil)
+				m.mockEnvFeaturesDescriber.EXPECT().AvailableFeatures().Return([]string{"mockFeature1", "mockFeature2"}, nil)
+				m.mockDeployer.EXPECT().UploadArtifacts().Return(&clideploy.UploadArtifactsOutput{}, nil)
+				m.mockDeployer.EXPECT().DeployWorkload(gomock.Any()).Return(nil, nil)
+				m.mockDeployer.EXPECT().IsServiceAvailableInRegion("").Return(false, nil)
+			},
+		},
+		"success for new deployment": {
+			mock: func(m *deployMocks) {
+				m.mockVersionGetter.EXPECT().Version().Return("", &mockErrStackNotFound)
+				m.mockWsReader.EXPECT().ReadWorkloadManifest(mockSvcName).Return([]byte(""), nil)
+				m.mockInterpolator.EXPECT().Interpolate("").Return("", nil)
+				m.mockMft = &mockWorkloadMft{
+					mockRequiredEnvironmentFeatures: func() []string {
+						return []string{"mockFeature1"}
+					},
+				}
+				m.mockEnvFeaturesDescriber.EXPECT().Version().Return("v1.mock", nil)
+				m.mockEnvFeaturesDescriber.EXPECT().AvailableFeatures().Return([]string{"mockFeature1", "mockFeature2"}, nil)
+				m.mockDeployer.EXPECT().UploadArtifacts().Return(&clideploy.UploadArtifactsOutput{}, nil)
+				m.mockDeployer.EXPECT().DeployWorkload(gomock.Any()).Return(nil, nil)
+				m.mockDeployer.EXPECT().IsServiceAvailableInRegion("").Return(false, nil)
 			},
 		},
 	}
 
-	for name, test := range tests {
+	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
+			// GIVEN
 			ctrl := gomock.NewController(t)
 			defer ctrl.Finish()
 
-			mockWorkspace := mocks.NewMockwsSvcDirReader(ctrl)
-			mockimageBuilderPusher := mocks.NewMockimageBuilderPusher(ctrl)
-			mocks := deploySvcMocks{
-				mockWs:                 mockWorkspace,
-				mockimageBuilderPusher: mockimageBuilderPusher,
+			m := &deployMocks{
+				mockDeployer:             mocks.NewMockworkloadDeployer(ctrl),
+				mockInterpolator:         mocks.NewMockinterpolator(ctrl),
+				mockWsReader:             mocks.NewMockwsWlDirReader(ctrl),
+				mockEnvFeaturesDescriber: mocks.NewMockversionCompatibilityChecker(ctrl),
+				mockPrompter:             mocks.NewMockprompter(ctrl),
+				mockVersionGetter:        mocks.NewMockversionGetter(ctrl),
 			}
-			test.setupMocks(mocks)
+			tc.mock(m)
+
 			opts := deploySvcOpts{
 				deployWkldVars: deployWkldVars{
-					name: test.inputSvc,
+					appName:            mockAppName,
+					name:               mockSvcName,
+					envName:            mockEnvName,
+					showDiff:           tc.inShowDiff,
+					skipDiffPrompt:     tc.inSkipDiffPrompt,
+					forceNewUpdate:     tc.inForceFlag,
+					allowWkldDowngrade: tc.inAllowDowngrade,
+					clientConfigured:   true,
 				},
-				unmarshal:          manifest.UnmarshalWorkload,
-				imageBuilderPusher: mockimageBuilderPusher,
-				ws:                 mockWorkspace,
+				svcType: tc.inSvcType,
+				newSvcDeployer: func() (workloadDeployer, error) {
+					return m.mockDeployer, nil
+				},
+				newInterpolator: func(app, env string) interpolator {
+					return m.mockInterpolator
+				},
+				ws: m.mockWsReader,
+				unmarshal: func(b []byte) (manifest.DynamicWorkload, error) {
+					return m.mockMft, nil
+				},
+				envFeaturesDescriber: m.mockEnvFeaturesDescriber,
+				prompt:               m.mockPrompter,
+				diffWriter:           m.mockDiffWriter,
+				svcVersionGetter:     m.mockVersionGetter,
+				targetApp:            &config.Application{},
+				targetEnv:            &config.Environment{},
+				templateVersion:      mockVersion,
 			}
 
-			gotErr := opts.configureContainerImage()
+			// WHEN
+			err := opts.Execute()
 
-			if test.wantErr != nil {
-				require.EqualError(t, gotErr, test.wantErr.Error())
+			// THEN
+			if tc.wantedError == nil {
+				require.NoError(t, err)
 			} else {
-				require.Nil(t, gotErr)
+				require.EqualError(t, err, tc.wantedError.Error())
+			}
+			if tc.wantedDiff != "" {
+				require.Equal(t, tc.wantedDiff, m.mockDiffWriter.String())
 			}
 		})
 	}
 }
 
-func TestSvcDeployOpts_pushAddonsTemplateToS3Bucket(t *testing.T) {
+type checkEnvironmentCompatibilityMocks struct {
+	ws                              *mocks.MockwsEnvironmentsLister
+	versionFeatureGetter            *mocks.MockversionCompatibilityChecker
+	requiredEnvironmentFeaturesFunc func() []string
+}
+
+func Test_isManifestCompatibleWithEnvironment(t *testing.T) {
 	mockError := errors.New("some error")
-	tests := map[string]struct {
-		inputSvc      string
-		inEnvironment *config.Environment
-		inApp         *config.Application
-
-		mockAppResourcesGetter func(m *mocks.MockappResourcesGetter)
-		mockS3Svc              func(m *mocks.MockartifactUploader)
-		mockAddons             func(m *mocks.Mocktemplater)
-
-		wantPath string
-		wantErr  error
+	testCases := map[string]struct {
+		setupMock    func(m *checkEnvironmentCompatibilityMocks)
+		mockManifest *mockWorkloadMft
+		wantedError  error
 	}{
-		"should push addons template to S3 bucket": {
-			inputSvc: "mockSvc",
-			inEnvironment: &config.Environment{
-				Name:   "mockEnv",
-				Region: "us-west-2",
+		"error getting environment version": {
+			setupMock: func(m *checkEnvironmentCompatibilityMocks) {
+				m.versionFeatureGetter.EXPECT().Version().Return("", mockError)
 			},
-			inApp: &config.Application{
-				Name: "mockApp",
-			},
-			mockAppResourcesGetter: func(m *mocks.MockappResourcesGetter) {
-				m.EXPECT().GetAppResourcesByRegion(&config.Application{
-					Name: "mockApp",
-				}, "us-west-2").Return(&stack.AppRegionalResources{
-					S3Bucket: "mockBucket",
-				}, nil)
-			},
-			mockAddons: func(m *mocks.Mocktemplater) {
-				m.EXPECT().Template().Return("some data", nil)
-			},
-			mockS3Svc: func(m *mocks.MockartifactUploader) {
-				m.EXPECT().PutArtifact("mockBucket", "mockSvc.addons.stack.yml", gomock.Any()).Return("https://mockS3DomainName/mockPath", nil)
-			},
-
-			wantErr:  nil,
-			wantPath: "https://mockS3DomainName/mockPath",
+			wantedError: errors.New("get environment \"mockEnv\" version: some error"),
 		},
-		"should return error if fail to get app resources": {
-			inputSvc: "mockSvc",
-			inEnvironment: &config.Environment{
-				Name:   "mockEnv",
-				Region: "us-west-2",
+		"error if env is not deployed": {
+			setupMock: func(m *checkEnvironmentCompatibilityMocks) {
+				m.versionFeatureGetter.EXPECT().Version().Return(version.EnvTemplateBootstrap, nil)
 			},
-			inApp: &config.Application{
-				Name: "mockApp",
-			},
-			mockAppResourcesGetter: func(m *mocks.MockappResourcesGetter) {
-				m.EXPECT().GetAppResourcesByRegion(&config.Application{
-					Name: "mockApp",
-				}, "us-west-2").Return(nil, mockError)
-			},
-			mockAddons: func(m *mocks.Mocktemplater) {
-				m.EXPECT().Template().Return("some data", nil)
-			},
-			mockS3Svc: func(m *mocks.MockartifactUploader) {},
-
-			wantErr: fmt.Errorf("get app resources: some error"),
+			wantedError: errors.New("cannot deploy a service to an undeployed environment. Please run \"copilot env deploy --name mockEnv\" to deploy the environment first"),
 		},
-		"should return error if fail to upload to S3 bucket": {
-			inputSvc: "mockSvc",
-			inEnvironment: &config.Environment{
-				Name:   "mockEnv",
-				Region: "us-west-2",
+		"error getting environment available features": {
+			setupMock: func(m *checkEnvironmentCompatibilityMocks) {
+				m.versionFeatureGetter.EXPECT().Version().Return("mockVersion", nil)
+				m.versionFeatureGetter.EXPECT().AvailableFeatures().Return(nil, mockError)
+				m.requiredEnvironmentFeaturesFunc = func() []string {
+					return nil
+				}
 			},
-			inApp: &config.Application{
-				Name: "mockApp",
-			},
-
-			mockAppResourcesGetter: func(m *mocks.MockappResourcesGetter) {
-				m.EXPECT().GetAppResourcesByRegion(&config.Application{
-					Name: "mockApp",
-				}, "us-west-2").Return(&stack.AppRegionalResources{
-					S3Bucket: "mockBucket",
-				}, nil)
-			},
-			mockAddons: func(m *mocks.Mocktemplater) {
-				m.EXPECT().Template().Return("some data", nil)
-			},
-			mockS3Svc: func(m *mocks.MockartifactUploader) {
-				m.EXPECT().PutArtifact("mockBucket", "mockSvc.addons.stack.yml", gomock.Any()).Return("", mockError)
-			},
-
-			wantErr: fmt.Errorf("put addons artifact to bucket mockBucket: some error"),
+			wantedError: errors.New("get available features of the mockEnv environment stack: some error"),
 		},
-		"should return empty url if the service doesn't have any addons": {
-			inputSvc: "mockSvc",
-			mockAddons: func(m *mocks.Mocktemplater) {
-				m.EXPECT().Template().Return("", &addon.ErrAddonsDirNotExist{
-					WlName: "mockSvc",
-				})
+		"not compatible": {
+			setupMock: func(m *checkEnvironmentCompatibilityMocks) {
+				m.versionFeatureGetter.EXPECT().Version().Return("mockVersion", nil)
+				m.versionFeatureGetter.EXPECT().AvailableFeatures().Return([]string{template.ALBFeatureName}, nil)
+				m.requiredEnvironmentFeaturesFunc = func() []string {
+					return []string{template.InternalALBFeatureName}
+				}
 			},
-			mockAppResourcesGetter: func(m *mocks.MockappResourcesGetter) {
-				m.EXPECT().GetAppResourcesByRegion(gomock.Any(), gomock.Any()).Times(0)
-			},
-			mockS3Svc: func(m *mocks.MockartifactUploader) {
-				m.EXPECT().PutArtifact(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
-			},
-			wantPath: "",
+			wantedError: errors.New(`environment "mockEnv" is on version "mockVersion" which does not support the "Internal ALB" feature`),
 		},
-		"should fail if addons cannot be retrieved from workspace": {
-			inputSvc: "mockSvc",
-			mockAddons: func(m *mocks.Mocktemplater) {
-				m.EXPECT().Template().Return("", mockError)
+		"compatible": {
+			setupMock: func(m *checkEnvironmentCompatibilityMocks) {
+				m.versionFeatureGetter.EXPECT().Version().Return("mockVersion", nil)
+				m.versionFeatureGetter.EXPECT().AvailableFeatures().Return([]string{template.ALBFeatureName, template.InternalALBFeatureName}, nil)
+				m.requiredEnvironmentFeaturesFunc = func() []string {
+					return []string{template.InternalALBFeatureName}
+				}
 			},
-			mockAppResourcesGetter: func(m *mocks.MockappResourcesGetter) {
-				m.EXPECT().GetAppResourcesByRegion(gomock.Any(), gomock.Any()).Times(0)
-			},
-			mockS3Svc: func(m *mocks.MockartifactUploader) {
-				m.EXPECT().PutArtifact(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
-			},
-			wantErr: fmt.Errorf("retrieve addons template: %w", mockError),
 		},
 	}
-
-	for name, tc := range tests {
+	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
+			// GIVEN
 			ctrl := gomock.NewController(t)
 			defer ctrl.Finish()
 
-			mockProjectSvc := mocks.NewMockstore(ctrl)
-			mockProjectResourcesGetter := mocks.NewMockappResourcesGetter(ctrl)
-			mockS3Svc := mocks.NewMockartifactUploader(ctrl)
-			mockAddons := mocks.NewMocktemplater(ctrl)
-			tc.mockAppResourcesGetter(mockProjectResourcesGetter)
-			tc.mockS3Svc(mockS3Svc)
-			tc.mockAddons(mockAddons)
-
-			opts := deploySvcOpts{
-				deployWkldVars: deployWkldVars{
-					name: tc.inputSvc,
-				},
-				store:             mockProjectSvc,
-				appCFN:            mockProjectResourcesGetter,
-				addons:            mockAddons,
-				s3:                mockS3Svc,
-				targetEnvironment: tc.inEnvironment,
-				targetApp:         tc.inApp,
+			m := &checkEnvironmentCompatibilityMocks{
+				versionFeatureGetter: mocks.NewMockversionCompatibilityChecker(ctrl),
+				ws:                   mocks.NewMockwsEnvironmentsLister(ctrl),
+			}
+			tc.setupMock(m)
+			mockManifest := &mockWorkloadMft{
+				mockRequiredEnvironmentFeatures: m.requiredEnvironmentFeaturesFunc,
 			}
 
-			gotPath, gotErr := opts.pushAddonsTemplateToS3Bucket()
+			// WHEN
+			err := validateWorkloadManifestCompatibilityWithEnv(m.ws, m.versionFeatureGetter, mockManifest, "mockEnv")
 
-			if gotErr != nil {
-				require.EqualError(t, gotErr, tc.wantErr.Error())
+			// THEN
+			if tc.wantedError == nil {
+				require.NoError(t, err)
 			} else {
-				require.Equal(t, tc.wantPath, gotPath)
+				require.EqualError(t, err, tc.wantedError.Error())
 			}
 		})
 	}
+}
+
+type mockWorkloadMft struct {
+	mockRequiredEnvironmentFeatures func() []string
+}
+
+func (m *mockWorkloadMft) ApplyEnv(envName string) (manifest.DynamicWorkload, error) {
+	return m, nil
+}
+
+func (m *mockWorkloadMft) Validate() error {
+	return nil
+}
+
+func (m *mockWorkloadMft) Load(sess *session.Session) error {
+	return nil
+}
+
+func (m *mockWorkloadMft) Manifest() interface{} {
+	return nil
+}
+
+func (m *mockWorkloadMft) RequiredEnvironmentFeatures() []string {
+	return m.mockRequiredEnvironmentFeatures()
 }

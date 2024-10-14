@@ -10,25 +10,61 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/cloudformation"
+	"gopkg.in/yaml.v3"
+
 	"github.com/aws/copilot-cli/internal/pkg/aws/ecr"
+	"github.com/aws/copilot-cli/internal/pkg/aws/partitions"
 	"github.com/aws/copilot-cli/internal/pkg/deploy"
 	"github.com/aws/copilot-cli/internal/pkg/template"
-	"gopkg.in/yaml.v3"
 )
 
 // DeployedAppMetadata wraps the Metadata field of a deployed
 // application StackSet.
 type DeployedAppMetadata struct {
-	Metadata AppResourcesConfig `yaml:"Metadata"`
+	Metadata AppResources `yaml:"Metadata"`
 }
 
-// AppResourcesConfig is a configuration for a deployed Application
-// StackSet.
+// AppResources is a configuration for a deployed Application StackSet.
+type AppResources struct {
+	AppResourcesConfig `yaml:",inline"`
+}
+
+// AppResourcesConfig is a configuration for a deployed Application StackSet.
 type AppResourcesConfig struct {
-	Accounts []string `yaml:"Accounts,flow"`
-	Services []string `yaml:"Services,flow"`
-	App      string   `yaml:"App"`
-	Version  int      `yaml:"Version"`
+	Accounts  []string               `yaml:"Accounts"`
+	Workloads []AppResourcesWorkload `yaml:"Workloads"`
+	App       string                 `yaml:"App"`
+	Version   int                    `yaml:"Version"`
+}
+
+// AppResourcesWorkload is a workload configuration for a deployed Application StackSet
+type AppResourcesWorkload struct {
+	Name    string `yaml:"Name"`
+	WithECR bool   `yaml:"WithECR"`
+}
+
+// UnmarshalYAML overrides the default YAML unmarshaling logic for the Image
+// struct, allowing it to perform more complex unmarshaling behavior.
+// This method implements the yaml.Unmarshaler (v3) interface.
+func (s *AppResources) UnmarshalYAML(value *yaml.Node) error {
+	if err := value.Decode(&s.AppResourcesConfig); err != nil {
+		return err
+	}
+
+	deprecated := struct {
+		Services []string `yaml:"Services"` // Deprecated since v1.2.0: Use Workloads instead of Services.
+	}{}
+	if err := value.Decode(&deprecated); err == nil {
+		// if there are services around, convert them to workloads
+		for _, svc := range deprecated.Services {
+			s.AppResourcesConfig.Workloads = append(s.AppResourcesConfig.Workloads, AppResourcesWorkload{
+				Name:    svc,
+				WithECR: true,
+			})
+		}
+	}
+
+	return nil
 }
 
 // AppStackConfig is for providing all the values to set up an
@@ -42,7 +78,7 @@ type AppStackConfig struct {
 type AppRegionalResources struct {
 	Region         string            // The region these resources are in.
 	KMSKeyARN      string            // A KMS Key ARN for encrypting Pipeline artifacts.
-	S3Bucket       string            // S3 bucket for Pipeline artifacts.
+	S3Bucket       string            // A bucket used for any Copilot artifacts that must be stored in S3 (pipelines, env files, etc).
 	RepositoryURLs map[string]string // The image repository URLs by service name.
 }
 
@@ -52,13 +88,16 @@ const (
 	appAdminRoleParamName         = "AdminRoleName"
 	appExecutionRoleParamName     = "ExecutionRoleName"
 	appDNSDelegationRoleParamName = "DNSDelegationRoleName"
-	appOutputKMSKey               = "KMSKeyARN"
-	appOutputS3Bucket             = "PipelineBucket"
-	appOutputECRRepoPrefix        = "ECRRepo"
+	appOutputKMSKey               = "KMSKeyARN"      // Name of the CloudFormation Output that holds the KMS Key ARN to encrypt artifact buckets.
+	appOutputS3Bucket             = "PipelineBucket" // Name of the CloudFormation Output that holds the Artifact Bucket name.
+	appOutputECRRepoPrefix        = "ECRRepo"        // Prefix of the CloudFormation Output name that holds the ECR image repository ARN for each service.
 	appDNSDelegatedAccountsKey    = "AppDNSDelegatedAccounts"
 	appDomainNameKey              = "AppDomainName"
+	appDomainHostedZoneIDKey      = "AppDomainHostedZoneID"
 	appNameKey                    = "AppName"
-	appDNSDelegationRoleName      = "DNSDelegationRole"
+
+	// arn:${partition}:iam::${account}:role/${roleName}
+	fmtStackSetAdminRoleARN = "arn:%s:iam::%s:role/%s"
 )
 
 var cfTemplateFunctions = map[string]interface{}{
@@ -70,7 +109,7 @@ var cfTemplateFunctions = map[string]interface{}{
 func AppConfigFrom(template *string) (*AppResourcesConfig, error) {
 	resourceConfig := DeployedAppMetadata{}
 	err := yaml.Unmarshal([]byte(*template), &resourceConfig)
-	return &resourceConfig.Metadata, err
+	return &resourceConfig.Metadata.AppResourcesConfig, err
 }
 
 // NewAppStackConfig sets up a struct which can provide values to CloudFormation for
@@ -82,9 +121,23 @@ func NewAppStackConfig(in *deploy.CreateAppInput) *AppStackConfig {
 	}
 }
 
-// Template returns the environment CloudFormation template.
+// Template returns the application CloudFormation template.
 func (c *AppStackConfig) Template() (string, error) {
-	content, err := c.parser.Read(appTemplatePath)
+	content, err := c.parser.Parse(appTemplatePath, struct {
+		TemplateVersion         string
+		AppDNSDelegatedAccounts []string
+		Domain                  string
+		Name                    string
+		PermissionsBoundary     string
+	}{
+		c.Version,
+		c.dnsDelegationAccounts(),
+		c.DomainName,
+		c.Name,
+		c.PermissionsBoundary,
+	}, template.WithFuncs(map[string]any{
+		"join": strings.Join,
+	}))
 	if err != nil {
 		return "", err
 	}
@@ -95,14 +148,18 @@ func (c *AppStackConfig) Template() (string, error) {
 func (c *AppStackConfig) ResourceTemplate(config *AppResourcesConfig) (string, error) {
 	// Sort the account IDs and Services so that the template we generate is deterministic
 	sort.Strings(config.Accounts)
-	sort.Strings(config.Services)
+	sort.SliceStable(config.Workloads, func(i, j int) bool {
+		return config.Workloads[i].Name < config.Workloads[j].Name
+	})
 
 	content, err := c.parser.Parse(appResourcesTemplatePath, struct {
 		*AppResourcesConfig
-		ServiceTagKey string
+		ServiceTagKey   string
+		TemplateVersion string
 	}{
 		config,
 		deploy.ServiceTagKey,
+		c.Version,
 	}, template.WithFuncs(cfTemplateFunctions))
 	if err != nil {
 		return "", err
@@ -130,14 +187,24 @@ func (c *AppStackConfig) Parameters() ([]*cloudformation.Parameter, error) {
 			ParameterValue: aws.String(c.DomainName),
 		},
 		{
+			ParameterKey:   aws.String(appDomainHostedZoneIDKey),
+			ParameterValue: aws.String(c.DomainHostedZoneID),
+		},
+		{
 			ParameterKey:   aws.String(appNameKey),
 			ParameterValue: aws.String(c.Name),
 		},
 		{
 			ParameterKey:   aws.String(appDNSDelegationRoleParamName),
-			ParameterValue: aws.String(dnsDelegationRoleName(c.Name)),
+			ParameterValue: aws.String(deploy.DNSDelegationRoleName(c.Name)),
 		},
 	}, nil
+}
+
+// SerializedParameters returns the CloudFormation stack's parameters serialized to a JSON document.
+func (s *AppStackConfig) SerializedParameters() (string, error) {
+	// No-op for now.
+	return "", nil
 }
 
 // Tags returns the tags that should be applied to the Application CloudFormation stack.
@@ -149,12 +216,12 @@ func (c *AppStackConfig) Tags() []*cloudformation.Tag {
 
 // StackName returns the name of the CloudFormation stack (based on the application name).
 func (c *AppStackConfig) StackName() string {
-	return fmt.Sprintf("%s-infrastructure-roles", c.Name)
+	return NameForAppStack(c.Name)
 }
 
 // StackSetName returns the name of the CloudFormation StackSet (based on the application name).
 func (c *AppStackConfig) StackSetName() string {
-	return fmt.Sprintf("%s-infrastructure", c.Name)
+	return NameForAppStackSet(c.Name)
 }
 
 // StackSetDescription returns the description of the StackSet for application resources.
@@ -168,9 +235,12 @@ func (c *AppStackConfig) stackSetAdminRoleName() string {
 
 // StackSetAdminRoleARN returns the role ARN of the role used to administer the Application
 // StackSet.
-func (c *AppStackConfig) StackSetAdminRoleARN() string {
-	//TODO find a partition-neutral way to construct this ARN
-	return fmt.Sprintf("arn:aws:iam::%s:role/%s", c.AccountID, c.stackSetAdminRoleName())
+func (c *AppStackConfig) StackSetAdminRoleARN(region string) (string, error) {
+	partition, err := partitions.Region(region).Partition()
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf(fmtStackSetAdminRoleARN, partition.ID(), c.AccountID, c.stackSetAdminRoleName()), nil
 }
 
 // StackSetExecutionRoleName returns the role name of the role used to actually create
@@ -247,8 +317,4 @@ func DNSDelegatedAccountsForStack(stack *cloudformation.Stack) []string {
 	}
 
 	return []string{}
-}
-
-func dnsDelegationRoleName(appName string) string {
-	return fmt.Sprintf("%s-%s", appName, appDNSDelegationRoleName)
 }

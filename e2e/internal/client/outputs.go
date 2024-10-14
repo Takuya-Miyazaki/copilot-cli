@@ -11,9 +11,11 @@ import (
 
 // SvcStatusOutput is the JSON output of the svc status.
 type SvcStatusOutput struct {
-	Service SvcStatusServiceInfo
-	Tasks   []SvcStatusTaskInfo  `json:"tasks"`
-	Alarms  []SvcStatusAlarmInfo `json:"alarms"`
+	Status    string `json:"status"`
+	Service   SvcStatusServiceInfo
+	Tasks     []SvcStatusTaskInfo  `json:"tasks"`
+	Alarms    []SvcStatusAlarmInfo `json:"alarms"`
+	LogEvents []*SvcLogsOutput     `json:"logEvents"`
 }
 
 // SvcStatusServiceInfo contains the status info of a service.
@@ -59,13 +61,16 @@ func toSvcStatusOutput(jsonInput string) (*SvcStatusOutput, error) {
 
 // SvcShowOutput is the JSON output of the svc show.
 type SvcShowOutput struct {
-	SvcName            string                      `json:"service"`
-	Type               string                      `json:"type"`
-	AppName            string                      `json:"application"`
-	Configs            []SvcShowConfigurations     `json:"configurations"`
-	ServiceDiscoveries []SvcShowServiceDiscoveries `json:"serviceDiscovery"`
-	Routes             []SvcShowRoutes             `json:"routes"`
-	Variables          []SvcShowVariables          `json:"variables"`
+	SvcName            string                            `json:"service"`
+	Type               string                            `json:"type"`
+	AppName            string                            `json:"application"`
+	Configs            []SvcShowConfigurations           `json:"configurations"`
+	ServiceDiscoveries []SvcShowServiceEndpoints         `json:"serviceDiscovery"`
+	ServiceConnects    []SvcShowServiceEndpoints         `json:"serviceConnect"`
+	Routes             []SvcShowRoutes                   `json:"routes"`
+	Variables          []SvcShowVariables                `json:"variables"`
+	Resources          map[string][]*SvcShowResourceInfo `json:"resources"`
+	Secrets            []SvcShowSecrets                  `json:"secrets"`
 }
 
 // SvcShowConfigurations contains serialized configuration parameters for a service.
@@ -81,12 +86,13 @@ type SvcShowConfigurations struct {
 type SvcShowRoutes struct {
 	Environment string `json:"environment"`
 	URL         string `json:"url"`
+	Ingress     string `json:"ingress"`
 }
 
-// SvcShowServiceDiscoveries contains serialized service discovery info for an service.
-type SvcShowServiceDiscoveries struct {
+// SvcShowServiceEndpoints contains serialized endpoint info for a service.
+type SvcShowServiceEndpoints struct {
 	Environment []string `json:"environment"`
-	Namespace   string   `json:"namespace"`
+	Endpoint    string   `json:"endpoint"`
 }
 
 // SvcShowVariables contains serialized environment variables for a service.
@@ -94,6 +100,19 @@ type SvcShowVariables struct {
 	Environment string `json:"environment"`
 	Name        string `json:"name"`
 	Value       string `json:"value"`
+}
+
+// SvcShowSecrets contains serialized secrets for a service.
+type SvcShowSecrets struct {
+	Environment string `json:"environment"`
+	Name        string `json:"name"`
+	Value       string `json:"value"`
+}
+
+// SvcShowResourceInfo contains serialized resource info for a service.
+type SvcShowResourceInfo struct {
+	Type       string `json:"type"`
+	PhysicalID string `json:"physicalID"`
 }
 
 func toSvcShowOutput(jsonInput string) (*SvcShowOutput, error) {
@@ -118,7 +137,7 @@ func toSvcListOutput(jsonInput string) (*SvcListOutput, error) {
 	return &output, json.Unmarshal([]byte(jsonInput), &output)
 }
 
-//JobListOutput is the JSON output for job list.
+// JobListOutput is the JSON output for job list.
 type JobListOutput struct {
 	Jobs []WkldDescription `json:"jobs"`
 }
@@ -161,9 +180,10 @@ func toAppShowOutput(jsonInput string) (*AppShowOutput, error) {
 
 // EnvShowOutput is the JSON output of env show.
 type EnvShowOutput struct {
-	Environment EnvDescription    `json:"environment"`
-	Services    []EnvShowServices `json:"services"`
-	Tags        map[string]string `json:"tags"`
+	Environment EnvDescription      `json:"environment"`
+	Services    []EnvShowServices   `json:"services"`
+	Tags        map[string]string   `json:"tags"`
+	Resources   []map[string]string `json:"resources"`
 }
 
 // EnvShowServices contains brief info about a service.
@@ -197,4 +217,24 @@ type EnvDescription struct {
 func toEnvListOutput(jsonInput string) (*EnvListOutput, error) {
 	var output EnvListOutput
 	return &output, json.Unmarshal([]byte(jsonInput), &output)
+}
+
+// PipelineShowOutput represents the JSON output of the "pipeline show" command.
+type PipelineShowOutput struct {
+	Name   string `json:"name"`
+	Stages []struct {
+		Name     string `json:"name"`
+		Category string `json:"category"`
+	} `json:"stages"`
+}
+
+// PipelineStatusOutput represents the JSON output of the "pipeline status" command.
+type PipelineStatusOutput struct {
+	States []struct {
+		Name    string `json:"stageName"`
+		Actions []struct {
+			Name   string `json:"name"`
+			Status string `json:"status"`
+		} `json:"actions"`
+	} `json:"stageStates"`
 }

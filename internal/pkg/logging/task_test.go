@@ -97,7 +97,7 @@ func TestEventsWriter_WriteEventsUntilStopped(t *testing.T) {
 			setUpMocks: func(m writeEventMocks) {
 				m.logGetter.EXPECT().LogEvents(gomock.Any()).Do(func(param cloudwatchlogs.LogEventsOpts) {
 					require.Equal(t, param.LogGroup, "/copilot/my-log-group")
-					require.Equal(t, param.LogStreams, []string{"copilot-task/my-log-group/task1", "copilot-task/my-log-group/task2", "copilot-task/my-log-group/task3"})
+					require.Equal(t, param.LogStreamPrefixFilters, []string{"copilot-task/my-log-group/task1", "copilot-task/my-log-group/task2", "copilot-task/my-log-group/task3"})
 				}).
 					Return(&cloudwatchlogs.LogEventsOutput{
 						Events: []*cloudwatchlogs.Event{},
@@ -133,12 +133,14 @@ func TestEventsWriter_WriteEventsUntilStopped(t *testing.T) {
 			tc.setUpMocks(mocks)
 
 			ew := &TaskClient{
-				GroupName: groupName,
-				Tasks:     tc.tasks,
+				groupName: groupName,
+				tasks:     tc.tasks,
 
-				Writer:       mockWriter{},
-				EventsLogger: mocks.logGetter,
-				Describer:    mocks.describer,
+				eventsWriter:  mockWriter{},
+				eventsLogger:  mocks.logGetter,
+				taskDescriber: mocks.describer,
+
+				sleep: func() {}, // no-op.
 			}
 
 			err := ew.WriteEventsUntilStopped()

@@ -6,6 +6,13 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"os"
+
+	"github.com/aws/copilot-cli/internal/pkg/aws/s3"
+	"github.com/spf13/afero"
+
+	"github.com/aws/aws-sdk-go/service/ssm"
+	"github.com/aws/copilot-cli/internal/pkg/aws/identity"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
@@ -47,19 +54,21 @@ type deleteTaskVars struct {
 
 type deleteTaskOpts struct {
 	deleteTaskVars
+	wsAppName string
 
 	// Dependencies to interact with other modules
-	store   store
-	prompt  prompter
-	spinner progress
-	sess    sessionProvider
-	sel     wsSelector
+	store    store
+	prompt   prompter
+	spinner  progress
+	provider sessionProvider
+	sel      wsSelector
 
 	// Generators for env-specific clients
-	newTaskSel      func(session *session.Session) cfTaskSelector
-	newTaskStopper  func(session *session.Session) taskStopper
-	newImageRemover func(session *session.Session) imageRemover
-	newStackManager func(session *session.Session) taskStackManager
+	newTaskSel       func(session *session.Session) cfTaskSelector
+	newTaskStopper   func(session *session.Session) taskStopper
+	newImageRemover  func(session *session.Session) imageRemover
+	newBucketEmptier func(session *session.Session) bucketEmptier
+	newStackManager  func(session *session.Session) taskStackManager
 
 	// Cached variables
 	session   *session.Session
@@ -67,40 +76,43 @@ type deleteTaskOpts struct {
 }
 
 func newDeleteTaskOpts(vars deleteTaskVars) (*deleteTaskOpts, error) {
-	store, err := config.NewStore()
+	ws, err := workspace.Use(afero.NewOsFs())
 	if err != nil {
-		return nil, fmt.Errorf("new config store: %w", err)
+		return nil, err
 	}
 
-	provider := sessions.NewProvider()
+	sessProvider := sessions.ImmutableProvider(sessions.UserAgentExtras("task delete"))
+	defaultSess, err := sessProvider.Default()
+	if err != nil {
+		return nil, fmt.Errorf("default session: %v", err)
+	}
 
+	store := config.NewSSMStore(identity.New(defaultSess), ssm.New(defaultSess), aws.StringValue(defaultSess.Config.Region))
 	prompter := prompt.New()
-
-	ws, err := workspace.New()
-	if err != nil {
-		return nil, fmt.Errorf("new workspace: %w", err)
-	}
-
 	return &deleteTaskOpts{
 		deleteTaskVars: vars,
+		wsAppName:      tryReadingAppName(),
 
-		store:   store,
-		spinner: termprogress.NewSpinner(log.DiagnosticWriter),
-		prompt:  prompter,
-		sess:    provider,
-		sel:     selector.NewWorkspaceSelect(prompter, store, ws),
+		store:    store,
+		spinner:  termprogress.NewSpinner(log.DiagnosticWriter),
+		prompt:   prompter,
+		provider: sessProvider,
+		sel:      selector.NewLocalWorkloadSelector(prompter, store, ws, selector.OnlyInitializedWorkloads),
 		newTaskSel: func(session *session.Session) cfTaskSelector {
-			cfn := cloudformation.New(session)
+			cfn := cloudformation.New(session, cloudformation.WithProgressTracker(os.Stderr))
 			return selector.NewCFTaskSelect(prompter, store, cfn)
 		},
 		newTaskStopper: func(session *session.Session) taskStopper {
 			return ecs.New(session)
 		},
 		newStackManager: func(session *session.Session) taskStackManager {
-			return cloudformation.New(session)
+			return cloudformation.New(session, cloudformation.WithProgressTracker(os.Stderr))
 		},
 		newImageRemover: func(session *session.Session) imageRemover {
 			return ecr.New(session)
+		},
+		newBucketEmptier: func(session *session.Session) bucketEmptier {
+			return s3.New(session)
 		},
 	}, nil
 }
@@ -171,7 +183,7 @@ func (o *deleteTaskOpts) validateFlagsWithDefaultCluster() error {
 	// The app flag defaults to the WS app so there's an edge case where it's possible to specify
 	// `copilot task delete --app ws-app --default` and not error out, but this should be taken as
 	// specifying "default".
-	if o.app != tryReadingAppName() {
+	if o.app != o.wsAppName {
 		return fmt.Errorf("cannot specify both `--app` and `--default`")
 	}
 
@@ -216,7 +228,7 @@ func (o *deleteTaskOpts) askEnvName() error {
 	if o.env != "" {
 		return nil
 	}
-	env, err := o.sel.Environment(taskDeleteEnvPrompt, "", o.app, appEnvOptionNone)
+	env, err := o.sel.Environment(taskDeleteEnvPrompt, "", o.app, prompt.Option{Value: appEnvOptionNone})
 	if err != nil {
 		return fmt.Errorf("select environment: %w", err)
 	}
@@ -261,7 +273,8 @@ func (o *deleteTaskOpts) Ask() error {
 
 	deleteConfirmed, err := o.prompt.Confirm(
 		deletePrompt,
-		taskDeleteConfirmHelp)
+		taskDeleteConfirmHelp,
+		prompt.WithConfirmFinalMessage())
 
 	if err != nil {
 		return fmt.Errorf("task delete confirmation prompt: %w", err)
@@ -277,7 +290,7 @@ func (o *deleteTaskOpts) getSession() (*session.Session, error) {
 		return o.session, nil
 	}
 	if o.defaultCluster {
-		sess, err := o.sess.Default()
+		sess, err := o.provider.Default()
 		if err != nil {
 			return nil, err
 		}
@@ -289,7 +302,7 @@ func (o *deleteTaskOpts) getSession() (*session.Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	sess, err := o.sess.FromRole(env.ManagerRoleARN, env.Region)
+	sess, err := o.provider.FromRole(env.ManagerRoleARN, env.Region)
 	if err != nil {
 		return nil, err
 	}
@@ -333,7 +346,6 @@ func (o *deleteTaskOpts) Execute() error {
 	if err := o.deleteStack(); err != nil {
 		return err
 	}
-
 	return nil
 }
 
@@ -375,7 +387,7 @@ func (o *deleteTaskOpts) clearECRRepository() error {
 		if err != nil {
 			return err
 		}
-		defaultSess, err = o.sess.DefaultWithRegion(aws.StringValue(regionalSession.Config.Region))
+		defaultSess, err = o.provider.DefaultWithRegion(aws.StringValue(regionalSession.Config.Region))
 		if err != nil {
 			return fmt.Errorf("get default session for ECR deletion: %s", err)
 		}
@@ -387,10 +399,22 @@ func (o *deleteTaskOpts) clearECRRepository() error {
 	err = o.newImageRemover(defaultSess).ClearRepository(ecrRepoName)
 	if err != nil {
 		o.spinner.Stop(log.Serrorln("Error emptying ECR repository."))
-		return fmt.Errorf("clear ECR repository for task %s: %w", o.name, err)
+		return fmt.Errorf("empty ECR repository for task %s: %w", o.name, err)
 	}
 
-	o.spinner.Stop(log.Ssuccessf("Emptied ECR repositories for task %s.\n", color.HighlightUserInput(o.name)))
+	o.spinner.Stop(log.Ssuccessf("Emptied ECR repository for task %s.\n", color.HighlightUserInput(o.name)))
+	return nil
+}
+
+func (o *deleteTaskOpts) emptyS3Bucket(info *deploy.TaskStackInfo) error {
+	o.spinner.Start(fmt.Sprintf("Emptying S3 bucket for task %s.", color.HighlightUserInput(o.name)))
+	err := o.newBucketEmptier(o.session).EmptyBucket(info.BucketName)
+	if err != nil {
+		o.spinner.Stop(log.Serrorln("Error emptying S3 bucket."))
+		return fmt.Errorf("empty S3 bucket for task %s: %w", o.name, err)
+	}
+
+	o.spinner.Stop(log.Ssuccessf("Emptied S3 bucket for task %s.\n", color.HighlightUserInput(o.name)))
 	return nil
 }
 
@@ -431,6 +455,11 @@ func (o *deleteTaskOpts) deleteStack() error {
 		// Stack does not exist; skip deleting it.
 		return nil
 	}
+	if info.BucketName != "" {
+		if err := o.emptyS3Bucket(info); err != nil {
+			return err
+		}
+	}
 	o.spinner.Start(fmt.Sprintf("Deleting CloudFormation stack for task %s.", color.HighlightUserInput(o.name)))
 	err = o.newStackManager(sess).DeleteTask(*info)
 	if err != nil {
@@ -442,7 +471,7 @@ func (o *deleteTaskOpts) deleteStack() error {
 	return nil
 }
 
-func (o *deleteTaskOpts) RecommendedActions() []string {
+func (o *deleteTaskOpts) RecommendActions() error {
 	return nil
 }
 
@@ -466,21 +495,7 @@ func BuildTaskDeleteCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := opts.Validate(); err != nil {
-				return err
-			}
-			if err := opts.Ask(); err != nil {
-				return err
-			}
-			if err := opts.Execute(); err != nil {
-				return err
-			}
-
-			log.Infoln("Recommended follow-up actions:")
-			for _, followup := range opts.RecommendedActions() {
-				log.Infof("- %s\n", followup)
-			}
-			return nil
+			return run(opts)
 		}),
 	}
 

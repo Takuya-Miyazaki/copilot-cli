@@ -5,8 +5,11 @@
 package codepipeline
 
 import (
+	"errors"
 	"fmt"
 	"time"
+
+	"github.com/xlab/treeprint"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/arn"
@@ -14,16 +17,13 @@ import (
 	cp "github.com/aws/aws-sdk-go/service/codepipeline"
 	rg "github.com/aws/copilot-cli/internal/pkg/aws/resourcegroups"
 	"github.com/aws/copilot-cli/internal/pkg/term/color"
-	"github.com/xlab/treeprint"
-)
-
-const (
-	pipelineResourceType = "codepipeline:pipeline"
 )
 
 type api interface {
 	GetPipeline(*cp.GetPipelineInput) (*cp.GetPipelineOutput, error)
 	GetPipelineState(*cp.GetPipelineStateInput) (*cp.GetPipelineStateOutput, error)
+	ListPipelineExecutions(input *cp.ListPipelineExecutionsInput) (*cp.ListPipelineExecutionsOutput, error)
+	RetryStageExecution(input *cp.RetryStageExecutionInput) (*cp.RetryStageExecutionOutput, error)
 }
 
 type resourceGetter interface {
@@ -38,7 +38,8 @@ type CodePipeline struct {
 
 // Pipeline represents an existing CodePipeline resource.
 type Pipeline struct {
-	Name      string    `json:"name"`
+	// Name is the resource name of the pipeline in CodePipeline, e.g. myapp-mypipeline-RANDOMSTRING.
+	Name      string    `json:"pipelineName"`
 	Region    string    `json:"region"`
 	AccountID string    `json:"accountId"`
 	Stages    []*Stage  `json:"stages"`
@@ -147,97 +148,32 @@ func (c *CodePipeline) GetPipeline(name string) (*Pipeline, error) {
 	}, nil
 }
 
-func (c *CodePipeline) getStage(s *cp.StageDeclaration) (*Stage, error) {
-	name := aws.StringValue(s.Name)
-	var category, provider, details string
-
-	if len(s.Actions) > 0 {
-		// Currently, we only support Source, Build and Deploy stages, all of which must contain at least one action.
-		action := s.Actions[0]
-		category = aws.StringValue(action.ActionTypeId.Category)
-		provider = aws.StringValue(action.ActionTypeId.Provider)
-
-		config := action.Configuration
-
-		switch category {
-
-		case "Source":
-			// Currently, our only source provider is GitHub: https://docs.aws.amazon.com/codepipeline/latest/userguide/reference-pipeline-structure.html#structure-configuration-examples
-			details = fmt.Sprintf("Repository: %s/%s", aws.StringValue(config["Owner"]), aws.StringValue(config["Repo"]))
-		case "Build":
-			// Currently, we use CodeBuild only for the build stage: https://docs.aws.amazon.com/codepipeline/latest/userguide/action-reference-CodeBuild.html#action-reference-CodeBuild-config
-			details = fmt.Sprintf("BuildProject: %s", aws.StringValue(config["ProjectName"]))
-		case "Deploy":
-			// Currently, we use Cloudformation only for he build stage: https://docs.aws.amazon.com/codepipeline/latest/userguide/action-reference-CloudFormation.html#action-reference-CloudFormation-config
-			details = fmt.Sprintf("StackName: %s", aws.StringValue(config["StackName"]))
-		default:
-			// not a currently recognized stage - empty string
-		}
-	}
-
-	stage := &Stage{
-		Name:     name,
-		Category: category,
-		Provider: provider,
-		Details:  details,
-	}
-	return stage, nil
-}
-
 // HumanString returns the stringified Stage struct with human readable format.
 // Example output:
 //   DeployTo-test	Deploy	Cloudformation	stackname: dinder-test-test
 func (s *Stage) HumanString() string {
-	return fmt.Sprintf("  %s\t%s\t%s\t%s\n", s.Name, s.Category, s.Provider, s.Details)
+	return fmt.Sprintf("%s\t%s\t%s\t%s\n", s.Name, s.Category, s.Provider, s.Details)
 }
 
-// ListPipelineNamesByTags retrieves the names of all pipelines for an application.
-func (c *CodePipeline) ListPipelineNamesByTags(tags map[string]string) ([]string, error) {
-	var pipelineNames []string
-	resources, err := c.rgClient.GetResourcesByTags(pipelineResourceType, tags)
+// RetryStageExecution tries to re-initiate a failed stage for the given pipeline.
+func (c *CodePipeline) RetryStageExecution(pipelineName, stageName string) error {
+	executionID, err := c.pipelineExecutionID(pipelineName)
 	if err != nil {
-		return nil, err
+		return fmt.Errorf("retrieve pipeline execution ID: %w", err)
 	}
 
-	for _, resource := range resources {
-		name, err := c.getPipelineName(resource.ARN)
-		if err != nil {
-			return nil, err
+	if _, err = c.client.RetryStageExecution(&cp.RetryStageExecutionInput{
+		PipelineExecutionId: &executionID,
+		PipelineName:        &pipelineName,
+		RetryMode:           aws.String(cp.StageRetryModeFailedActions),
+		StageName:           &stageName,
+	}); err != nil {
+		noFailedActions := &cp.StageNotRetryableException{}
+		if !errors.As(err, &noFailedActions) {
+			return fmt.Errorf("retry pipeline source stage: %w", err)
 		}
-		pipelineNames = append(pipelineNames, name)
 	}
-
-	return pipelineNames, nil
-}
-
-// GetPipelineByTags retrieves all of pipelines for an application.
-func (c *CodePipeline) GetPipelinesByTags(tags map[string]string) ([]*Pipeline, error) {
-	var pipelines []*Pipeline
-	resources, err := c.rgClient.GetResourcesByTags(pipelineResourceType, tags)
-	if err != nil {
-		return nil, err
-	}
-	for _, resource := range resources {
-		name, err := c.getPipelineName(resource.ARN)
-		if err != nil {
-			return nil, err
-		}
-		pipeline, err := c.GetPipeline(name)
-		if err != nil {
-			return nil, err
-		}
-		pipelines = append(pipelines, pipeline)
-	}
-	return pipelines, nil
-}
-
-func (c *CodePipeline) getPipelineName(resourceArn string) (string, error) {
-	parsedArn, err := arn.Parse(resourceArn)
-	if err != nil {
-		return "", fmt.Errorf("parse pipeline ARN: %s", resourceArn)
-	}
-
-	return parsedArn.Resource, nil
+	return nil
 }
 
 // GetPipelineState retrieves status information from a given pipeline.
@@ -284,10 +220,6 @@ func (c *CodePipeline) GetPipelineState(name string) (*PipelineState, error) {
 	}, nil
 }
 
-func (sa StageAction) humanString() string {
-	return sa.Name + "\t\t" + fmtStatus(sa.Status)
-}
-
 // HumanString returns the stringified PipelineState struct with human readable format.
 // Example output:
 //   DeployTo-test	Deploy	Cloudformation	stackname: dinder-test-test
@@ -295,12 +227,73 @@ func (ss *StageState) HumanString() string {
 	status := ss.AggregateStatus()
 	transition := ss.Transition
 	stageString := fmt.Sprintf("%s\t%s\t%s", ss.StageName, fmtStatus(transition), fmtStatus(status))
-	tree := treeprint.New()
-	tree = tree.AddBranch(stageString)
+	tree := treeprint.NewWithRoot(stageString)
 	for _, action := range ss.Actions {
 		tree.AddNode(action.humanString())
 	}
 	return tree.String()
+}
+
+func (c *CodePipeline) getStage(s *cp.StageDeclaration) (*Stage, error) {
+	name := aws.StringValue(s.Name)
+	var category, provider, details string
+
+	if len(s.Actions) > 0 {
+		// Currently, we only support Source, Build and Deploy stages, all of which must contain at least one action.
+		action := s.Actions[0]
+		category = aws.StringValue(action.ActionTypeId.Category)
+		provider = aws.StringValue(action.ActionTypeId.Provider)
+
+		config := action.Configuration
+
+		switch category {
+
+		case "Source":
+			// https://docs.aws.amazon.com/codepipeline/latest/userguide/reference-pipeline-structure.html#structure-configuration-examples
+			switch provider {
+			case "GitHub":
+				details = fmt.Sprintf("Repository: %s/%s", aws.StringValue(config["Owner"]), aws.StringValue(config["Repo"]))
+			case "CodeCommit":
+				details = fmt.Sprintf("Repository: %s", aws.StringValue(config["RepositoryName"]))
+			case "CodeStarSourceConnection":
+				details = fmt.Sprintf("Repository: %s", aws.StringValue(config["FullRepositoryId"]))
+			}
+		case "Build":
+			// Currently, we use CodeBuild only for the build stage: https://docs.aws.amazon.com/codepipeline/latest/userguide/action-reference-CodeBuild.html#action-reference-CodeBuild-config
+			details = fmt.Sprintf("BuildProject: %s", aws.StringValue(config["ProjectName"]))
+		case "Deploy":
+			// Currently, we use Cloudformation only for the build stage: https://docs.aws.amazon.com/codepipeline/latest/userguide/action-reference-CloudFormation.html#action-reference-CloudFormation-config
+			details = fmt.Sprintf("StackName: %s", aws.StringValue(config["StackName"]))
+		}
+	}
+
+	stage := &Stage{
+		Name:     name,
+		Category: category,
+		Provider: provider,
+		Details:  details,
+	}
+	return stage, nil
+}
+
+// pipelineExecutionID returns the ExecutionID of the most recent execution of a pipeline.
+func (c *CodePipeline) pipelineExecutionID(pipelineName string) (string, error) {
+	input := &cp.ListPipelineExecutionsInput{
+		MaxResults:   aws.Int64(1),
+		PipelineName: &pipelineName,
+	}
+	output, err := c.client.ListPipelineExecutions(input)
+	if err != nil {
+		return "", fmt.Errorf("list pipeline execution for %s: %w", pipelineName, err)
+	}
+	if len(output.PipelineExecutionSummaries) == 0 {
+		return "", fmt.Errorf("no pipeline execution IDs found for %s", pipelineName)
+	}
+	return aws.StringValue(output.PipelineExecutionSummaries[0].PipelineExecutionId), nil
+}
+
+func (sa StageAction) humanString() string {
+	return sa.Name + "\t\t" + fmtStatus(sa.Status)
 }
 
 func fmtStatus(status string) string {

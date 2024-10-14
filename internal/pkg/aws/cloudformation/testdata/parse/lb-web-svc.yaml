@@ -57,28 +57,20 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
+        Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
               Service: ecs-tasks.amazonaws.com
             Action: 'sts:AssumeRole'
       Policies:
-        - PolicyName: 'DenyIAMExceptTaggedRoles'
+        - PolicyName: 'DenyIAM'
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: 'Deny'
                 Action: 'iam:*'
                 Resource: '*'
-              - Effect: 'Allow'
-                Action: 'sts:AssumeRole'
-                Resource:
-                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/*'
-                Condition:
-                  StringEquals:
-                    'iam:ResourceTag/copilot-application': !Sub '${AppName}'
-                    'iam:ResourceTag/copilot-environment': !Sub '${EnvName}'
-
   DiscoveryService:
     Type: AWS::ServiceDiscovery::Service
     Metadata:
@@ -110,6 +102,7 @@ Resources:
       EnvStack: !Sub '${AppName}-${EnvName}'
       Parameters:
         - 'ALBWorkloads'
+        - 'Aliases'
       # We need to force trigger this lambda function on all deployments, so we give it a random ID as input on all event types.
       UpdateID: c31b2422-5c1f-48cb-9a58-f0f418984d27
 
@@ -130,21 +123,18 @@ Resources:
         AwsvpcConfiguration:
           AssignPublicIp: ENABLED
           Subnets:
-            - Fn::Select:
-                - 0
-                - Fn::Split:
-                    - ','
-                    - Fn::ImportValue: !Sub '${AppName}-${EnvName}-PublicSubnets'
-            - Fn::Select:
-                - 1
-                - Fn::Split:
-                    - ','
-                    - Fn::ImportValue: !Sub '${AppName}-${EnvName}-PublicSubnets'
+            Fn::Split:
+              - ','
+              - Fn::ImportValue: !Sub '${AppName}-${EnvName}-PublicSubnets'
           SecurityGroups:
             - Fn::ImportValue: !Sub '${AppName}-${EnvName}-EnvironmentSecurityGroup'
       DeploymentConfiguration:
         MinimumHealthyPercent: 100
         MaximumPercent: 200
+        Alarms:
+          AlarmNames: []
+          Enable: false
+          Rollback: true
       # This may need to be adjusted if the container takes a while to start up
       HealthCheckGracePeriodSeconds: 60
       LoadBalancers:
@@ -165,9 +155,9 @@ Resources:
       Protocol: HTTP
       TargetGroupAttributes:
         - Key: deregistration_delay.timeout_seconds
-          Value: 60                  # Default is 300.
+          Value: 60
         - Key: stickiness.enabled
-          Value: !Ref Stickiness
+          Value: true
       TargetType: ip
       VpcId:
         Fn::ImportValue:

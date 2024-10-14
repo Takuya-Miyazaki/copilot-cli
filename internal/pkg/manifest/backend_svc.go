@@ -4,10 +4,10 @@
 package manifest
 
 import (
-	"time"
+	"maps"
 
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/ecs"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
 	"github.com/aws/copilot-cli/internal/pkg/template"
 	"github.com/imdario/mergo"
 )
@@ -16,71 +16,67 @@ const (
 	backendSvcManifestPath = "workloads/services/backend/manifest.yml"
 )
 
-// BackendServiceProps represents the configuration needed to create a backend service.
-type BackendServiceProps struct {
-	WorkloadProps
-	Port        uint16
-	HealthCheck *ContainerHealthCheck // Optional healthcheck configuration.
-}
-
 // BackendService holds the configuration to create a backend service manifest.
 type BackendService struct {
 	Workload             `yaml:",inline"`
 	BackendServiceConfig `yaml:",inline"`
 	// Use *BackendServiceConfig because of https://github.com/imdario/mergo/issues/146
 	Environments map[string]*BackendServiceConfig `yaml:",flow"`
-
-	parser template.Parser
+	parser       template.Parser
 }
 
-// BackendServiceConfig holds the configuration that can be overriden per environments.
+// BackendServiceConfig holds the configuration that can be overridden per environments.
 type BackendServiceConfig struct {
-	ImageConfig imageWithPortAndHealthcheck `yaml:"image,flow"`
-	TaskConfig  `yaml:",inline"`
-	*Logging    `yaml:"logging,flow"`
-	Sidecar     `yaml:",inline"`
+	ImageConfig      ImageWithHealthcheckAndOptionalPort `yaml:"image,flow"`
+	ImageOverride    `yaml:",inline"`
+	HTTP             HTTP `yaml:"http,flow"`
+	TaskConfig       `yaml:",inline"`
+	Logging          Logging                   `yaml:"logging,flow"`
+	Sidecars         map[string]*SidecarConfig `yaml:"sidecars"` // NOTE: keep the pointers because `mergo` doesn't automatically deep merge map's value unless it's a pointer type.
+	Network          NetworkConfig             `yaml:"network"`
+	PublishConfig    PublishConfig             `yaml:"publish"`
+	TaskDefOverrides []OverrideRule            `yaml:"taskdef_overrides"`
+	DeployConfig     DeploymentConfig          `yaml:"deployment"`
+	Observability    Observability             `yaml:"observability"`
 }
 
-// LogConfigOpts converts the service's Firelens configuration into a format parsable by the templates pkg.
-func (bc *BackendServiceConfig) LogConfigOpts() *template.LogConfigOpts {
-	if bc.Logging == nil {
-		return nil
-	}
-	return bc.logConfigOpts()
-}
-
-type imageWithPortAndHealthcheck struct {
-	ServiceImageWithPort `yaml:",inline"`
-	HealthCheck          *ContainerHealthCheck `yaml:"healthcheck"`
-}
-
-// ContainerHealthCheck holds the configuration to determine if the service container is healthy.
-// See https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-ecs-taskdefinition-healthcheck.html
-type ContainerHealthCheck struct {
-	Command     []string       `yaml:"command"`
-	Interval    *time.Duration `yaml:"interval"`
-	Retries     *int           `yaml:"retries"`
-	Timeout     *time.Duration `yaml:"timeout"`
-	StartPeriod *time.Duration `yaml:"start_period"`
+// BackendServiceProps represents the configuration needed to create a backend service.
+type BackendServiceProps struct {
+	WorkloadProps
+	Port        uint16
+	Path        string               // Optional path if multiple ports are exposed.
+	HealthCheck ContainerHealthCheck // Optional healthcheck configuration.
+	Platform    PlatformArgsOrString // Optional platform configuration.
 }
 
 // NewBackendService applies the props to a default backend service configuration with
 // minimal task sizes, single replica, no healthcheck, and then returns it.
 func NewBackendService(props BackendServiceProps) *BackendService {
 	svc := newDefaultBackendService()
-	var healthCheck *ContainerHealthCheck
-	if props.HealthCheck != nil {
-		// Create the healthcheck field only if the caller specified a healthcheck.
-		healthCheck = newDefaultContainerHealthCheck()
-		healthCheck.apply(props.HealthCheck)
-	}
 	// Apply overrides.
-	svc.Name = aws.String(props.Name)
+	svc.Name = stringP(props.Name)
 	svc.BackendServiceConfig.ImageConfig.Image.Location = stringP(props.Image)
-	svc.BackendServiceConfig.ImageConfig.Build.BuildArgs.Dockerfile = stringP(props.Dockerfile)
+	svc.BackendServiceConfig.ImageConfig.Image.Build.BuildArgs.Dockerfile = stringP(props.Dockerfile)
 	svc.BackendServiceConfig.ImageConfig.Port = uint16P(props.Port)
-	svc.BackendServiceConfig.ImageConfig.HealthCheck = healthCheck
+
+	svc.BackendServiceConfig.ImageConfig.HealthCheck = props.HealthCheck
+	svc.BackendServiceConfig.Platform = props.Platform
+	if isWindowsPlatform(props.Platform) {
+		svc.BackendServiceConfig.TaskConfig.CPU = aws.Int(MinWindowsTaskCPU)
+		svc.BackendServiceConfig.TaskConfig.Memory = aws.Int(MinWindowsTaskMemory)
+	}
 	svc.parser = template.New()
+	for _, envName := range props.PrivateOnlyEnvironments {
+		svc.Environments[envName] = &BackendServiceConfig{
+			Network: NetworkConfig{
+				VPC: vpcConfig{
+					Placement: PlacementArgOrString{
+						PlacementString: placementStringP(PrivateSubnetPlacement),
+					},
+				},
+			},
+		}
+	}
 	return svc
 }
 
@@ -90,7 +86,6 @@ func (s *BackendService) MarshalBinary() ([]byte, error) {
 	content, err := s.parser.Parse(backendSvcManifestPath, *s, template.WithFuncs(map[string]interface{}{
 		"fmtSlice":   template.FmtSliceFunc,
 		"quoteSlice": template.QuoteSliceFunc,
-		"dirName":    tplDirName,
 	}))
 	if err != nil {
 		return nil, err
@@ -98,29 +93,85 @@ func (s *BackendService) MarshalBinary() ([]byte, error) {
 	return content.Bytes(), nil
 }
 
-// BuildRequired returns if the service requires building from the local Dockerfile.
-func (s *BackendService) BuildRequired() (bool, error) {
-	return requiresBuild(s.ImageConfig.Image)
+func (s *BackendService) requiredEnvironmentFeatures() []string {
+	var features []string
+	if !s.HTTP.IsEmpty() {
+		features = append(features, template.InternalALBFeatureName)
+	}
+	features = append(features, s.Network.requiredEnvFeatures()...)
+	features = append(features, s.Storage.requiredEnvFeatures()...)
+	return features
 }
 
-// BuildArgs returns a docker.BuildArguments object for the service given a workspace root directory
-func (s *BackendService) BuildArgs(wsRoot string) *DockerBuildArgs {
-	return s.ImageConfig.BuildConfig(wsRoot)
+// Dockerfile returns the relative path of the Dockerfile in the manifest.
+func (s *BackendService) Dockerfile() string {
+	return s.ImageConfig.Image.dockerfilePath()
 }
 
-// ApplyEnv returns the service manifest with environment overrides.
-// If the environment passed in does not have any overrides then it returns itself.
-func (s BackendService) ApplyEnv(envName string) (*BackendService, error) {
+// Port returns the exposed port in the manifest.
+// If the backend service is not meant to be reachable, then ok is set to false.
+func (s *BackendService) Port() (port uint16, ok bool) {
+	value := s.BackendServiceConfig.ImageConfig.Port
+	if value == nil {
+		return 0, false
+	}
+	return aws.Uint16Value(value), true
+}
+
+// Publish returns the list of topics where notifications can be published.
+func (s *BackendService) Publish() []Topic {
+	return s.BackendServiceConfig.PublishConfig.publishedTopics()
+}
+
+// BuildArgs returns a docker.BuildArguments object for the service given a context directory.
+func (s *BackendService) BuildArgs(contextDir string) (map[string]*DockerBuildArgs, error) {
+	required, err := requiresBuild(s.ImageConfig.Image)
+	if err != nil {
+		return nil, err
+	}
+	// Creating an map to store buildArgs of all sidecar images and main container image.
+	buildArgsPerContainer := make(map[string]*DockerBuildArgs, len(s.Sidecars)+1)
+	if required {
+		buildArgsPerContainer[aws.StringValue(s.Name)] = s.ImageConfig.Image.BuildConfig(contextDir)
+	}
+	return buildArgs(contextDir, buildArgsPerContainer, s.Sidecars)
+}
+
+// EnvFiles returns the locations of all env files against the ws root directory.
+// This method returns a map[string]string where the keys are container names
+// and the values are either env file paths or empty strings.
+func (s *BackendService) EnvFiles() map[string]string {
+	return envFiles(s.Name, s.TaskConfig, s.Logging, s.Sidecars)
+}
+
+// ContainerDependencies returns a map of ContainerDependency objects for the BackendService
+// including dependencies for its main container, any logging sidecar, and additional sidecars.
+func (s *BackendService) ContainerDependencies() map[string]ContainerDependency {
+	return containerDependencies(aws.StringValue(s.Name), s.ImageConfig.Image, s.Logging, s.Sidecars)
+}
+
+func (s *BackendService) subnets() *SubnetListOrArgs {
+	return &s.Network.VPC.Placement.Subnets
+}
+
+func (s BackendService) applyEnv(envName string) (workloadManifest, error) {
 	overrideConfig, ok := s.Environments[envName]
 	if !ok {
 		return &s, nil
 	}
+
+	if overrideConfig == nil {
+		return &s, nil
+	}
+
 	// Apply overrides to the original service s.
-	err := mergo.Merge(&s, BackendService{
-		BackendServiceConfig: *overrideConfig,
-	}, mergo.WithOverride, mergo.WithOverwriteWithEmptyValue)
-	if err != nil {
-		return nil, err
+	for _, t := range defaultTransformers {
+		err := mergo.Merge(&s, BackendService{
+			BackendServiceConfig: *overrideConfig,
+		}, mergo.WithOverride, mergo.WithTransformers(t))
+		if err != nil {
+			return nil, err
+		}
 	}
 	s.Environments = nil
 	return &s, nil
@@ -130,81 +181,55 @@ func (s BackendService) ApplyEnv(envName string) (*BackendService, error) {
 func newDefaultBackendService() *BackendService {
 	return &BackendService{
 		Workload: Workload{
-			Type: aws.String(BackendServiceType),
+			Type: aws.String(manifestinfo.BackendServiceType),
 		},
 		BackendServiceConfig: BackendServiceConfig{
-			ImageConfig: imageWithPortAndHealthcheck{},
+			ImageConfig: ImageWithHealthcheckAndOptionalPort{},
 			TaskConfig: TaskConfig{
 				CPU:    aws.Int(256),
 				Memory: aws.Int(512),
 				Count: Count{
 					Value: aws.Int(1),
+					AdvancedCount: AdvancedCount{ // Leave advanced count empty while passing down the type of the workload.
+						workloadType: manifestinfo.BackendServiceType,
+					},
+				},
+				ExecuteCommand: ExecuteCommand{
+					Enable: aws.Bool(false),
+				},
+			},
+			Network: NetworkConfig{
+				VPC: vpcConfig{
+					Placement: PlacementArgOrString{
+						PlacementString: placementStringP(PublicSubnetPlacement),
+					},
 				},
 			},
 		},
+		Environments: map[string]*BackendServiceConfig{},
 	}
 }
 
-// newDefaultContainerHealthCheck returns container health check configuration
-// that's identical to a load balanced web service's defaults.
-func newDefaultContainerHealthCheck() *ContainerHealthCheck {
-	return &ContainerHealthCheck{
-		Command:     []string{"CMD-SHELL", "curl -f http://localhost/ || exit 1"},
-		Interval:    durationp(10 * time.Second),
-		Retries:     aws.Int(2),
-		Timeout:     durationp(5 * time.Second),
-		StartPeriod: durationp(0 * time.Second),
-	}
-}
+// ExposedPorts returns all the ports that are container ports available to receive traffic.
+func (b *BackendService) ExposedPorts() (ExposedPortsIndex, error) {
+	exposedPorts := make(map[uint16]ExposedPort)
 
-// apply overrides the healthcheck's fields if other has them set.
-func (hc *ContainerHealthCheck) apply(other *ContainerHealthCheck) {
-	if other.Command != nil {
-		hc.Command = other.Command
+	workloadName := aws.StringValue(b.Name)
+	for name, sidecar := range b.Sidecars {
+		newExposedPorts, err := sidecar.exposePorts(exposedPorts, name)
+		if err != nil {
+			return ExposedPortsIndex{}, err
+		}
+		maps.Copy(exposedPorts, newExposedPorts)
 	}
-	if other.Interval != nil {
-		hc.Interval = other.Interval
+	for _, rule := range b.HTTP.RoutingRules() {
+		maps.Copy(exposedPorts, rule.exposePorts(exposedPorts, workloadName))
 	}
-	if other.Retries != nil {
-		hc.Retries = other.Retries
-	}
-	if other.Timeout != nil {
-		hc.Timeout = other.Timeout
-	}
-	if other.StartPeriod != nil {
-		hc.StartPeriod = other.StartPeriod
-	}
-}
-
-// applyIfNotSet changes the healthcheck's fields only if they were not set and the other healthcheck has them set.
-func (hc *ContainerHealthCheck) applyIfNotSet(other *ContainerHealthCheck) {
-	if hc.Command == nil && other.Command != nil {
-		hc.Command = other.Command
-	}
-	if hc.Interval == nil && other.Interval != nil {
-		hc.Interval = other.Interval
-	}
-	if hc.Retries == nil && other.Retries != nil {
-		hc.Retries = other.Retries
-	}
-	if hc.Timeout == nil && other.Timeout != nil {
-		hc.Timeout = other.Timeout
-	}
-	if hc.StartPeriod == nil && other.StartPeriod != nil {
-		hc.StartPeriod = other.StartPeriod
-	}
-}
-
-// HealthCheckOpts converts the image's healthcheck configuration into a format parsable by the templates pkg.
-func (i imageWithPortAndHealthcheck) HealthCheckOpts() *ecs.HealthCheck {
-	if i.HealthCheck == nil {
-		return nil
-	}
-	return &ecs.HealthCheck{
-		Command:     aws.StringSlice(i.HealthCheck.Command),
-		Interval:    aws.Int64(int64(i.HealthCheck.Interval.Seconds())),
-		Retries:     aws.Int64(int64(*i.HealthCheck.Retries)),
-		StartPeriod: aws.Int64(int64(i.HealthCheck.StartPeriod.Seconds())),
-		Timeout:     aws.Int64(int64(i.HealthCheck.Timeout.Seconds())),
-	}
+	maps.Copy(exposedPorts, b.ImageConfig.exposePorts(exposedPorts, workloadName))
+	portsForContainer, containerForPort := prepareParsedExposedPortsMap(exposedPorts)
+	return ExposedPortsIndex{
+		WorkloadName:      workloadName,
+		PortsForContainer: portsForContainer,
+		ContainerForPort:  containerForPort,
+	}, nil
 }

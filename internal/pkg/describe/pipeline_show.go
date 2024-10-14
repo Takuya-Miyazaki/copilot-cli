@@ -11,15 +11,14 @@ import (
 	"text/tabwriter"
 
 	"github.com/aws/copilot-cli/internal/pkg/aws/sessions"
+	"github.com/aws/copilot-cli/internal/pkg/deploy"
+	"github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation/stack"
+	describestack "github.com/aws/copilot-cli/internal/pkg/describe/stack"
 
-	"github.com/aws/aws-sdk-go/service/cloudformation" // TODO refactor this into our own pkg
+	// TODO refactor this into our own pkg
 	"github.com/aws/copilot-cli/internal/pkg/aws/codepipeline"
 	"github.com/aws/copilot-cli/internal/pkg/term/color"
 )
-
-type stackResourcesDescriber interface {
-	StackResources(stackName string) ([]*cloudformation.StackResource, error)
-}
 
 type pipelineGetter interface {
 	GetPipeline(pipelineName string) (*codepipeline.Pipeline, error)
@@ -27,53 +26,59 @@ type pipelineGetter interface {
 
 // Pipeline contains serialized parameters for a pipeline.
 type Pipeline struct {
+	// Name is the user provided name for a pipeline
+	Name string `json:"name"`
 	codepipeline.Pipeline
 
-	Resources []*CfnResource `json:"resources,omitempty"`
+	Resources []*describestack.Resource `json:"resources,omitempty"`
 }
 
-// PipelineDescriber retrieves information about an application.
+// PipelineDescriber retrieves information about a deployed pipeline.
 type PipelineDescriber struct {
-	pipelineName  string
+	pipeline      deploy.Pipeline
 	showResources bool
 
-	pipelineSvc             pipelineGetter
-	stackResourcesDescriber stackResourcesDescriber
+	pipelineSvc pipelineGetter
+	cfn         stackDescriber
 }
 
 // NewPipelineDescriber instantiates a new pipeline describer
-func NewPipelineDescriber(pipelineName string, showResources bool) (*PipelineDescriber, error) {
-	sess, err := sessions.NewProvider().Default()
+func NewPipelineDescriber(pipeline deploy.Pipeline, showResources bool) (*PipelineDescriber, error) {
+	sess, err := sessions.ImmutableProvider().Default()
 	if err != nil {
 		return nil, err
 	}
 
-	describer := newStackDescriber(sess)
 	pipelineSvc := codepipeline.New(sess)
 
 	return &PipelineDescriber{
-		pipelineName:            pipelineName,
-		pipelineSvc:             pipelineSvc,
-		showResources:           showResources,
-		stackResourcesDescriber: describer,
+		pipeline: pipeline,
+
+		pipelineSvc:   pipelineSvc,
+		showResources: showResources,
+		cfn:           describestack.NewStackDescriber(stack.NameForPipeline(pipeline.AppName, pipeline.Name, pipeline.IsLegacy), sess),
 	}, nil
 }
 
 // Describe returns description of a pipeline.
 func (d *PipelineDescriber) Describe() (HumanJSONStringer, error) {
-	cp, err := d.pipelineSvc.GetPipeline(d.pipelineName)
+	cp, err := d.pipelineSvc.GetPipeline(d.pipeline.ResourceName)
 	if err != nil {
 		return nil, fmt.Errorf("get pipeline: %w", err)
 	}
-	var resources []*CfnResource
+	var resources []*describestack.Resource
 	if d.showResources {
-		stackResources, err := d.stackResourcesDescriber.StackResources(d.pipelineName)
+		stackResources, err := d.cfn.Resources()
 		if err != nil && !IsStackNotExistsErr(err) {
 			return nil, fmt.Errorf("retrieve pipeline resources: %w", err)
 		}
-		resources = flattenResources(stackResources)
+		resources = stackResources
 	}
-	pipeline := &Pipeline{*cp, resources}
+	pipeline := &Pipeline{
+		Name:      d.pipeline.Name,
+		Pipeline:  *cp,
+		Resources: resources,
+	}
 	return pipeline, nil
 }
 
@@ -94,25 +99,25 @@ func (p *Pipeline) HumanString() string {
 	fmt.Fprint(writer, color.Bold.Sprint("About\n\n"))
 	writer.Flush()
 	fmt.Fprintf(writer, "  %s\t%s\n", "Name", p.Name)
-	fmt.Fprintf(writer, "  %s\t%s\n", "Region", p.Region)
-	fmt.Fprintf(writer, "  %s\t%s\n", "AccountID", p.AccountID)
-	fmt.Fprintf(writer, "  %s\t%s\n", "Created At", humanizeTime(p.CreatedAt))
-	fmt.Fprintf(writer, "  %s\t%s\n", "Updated At", humanizeTime(p.UpdatedAt))
+	fmt.Fprintf(writer, "  %s\t%s\n", "Region", p.Pipeline.Region)
+	fmt.Fprintf(writer, "  %s\t%s\n", "AccountID", p.Pipeline.AccountID)
+	fmt.Fprintf(writer, "  %s\t%s\n", "Created At", humanizeTime(p.Pipeline.CreatedAt))
+	fmt.Fprintf(writer, "  %s\t%s\n", "Updated At", humanizeTime(p.Pipeline.UpdatedAt))
 	writer.Flush()
 	fmt.Fprint(writer, color.Bold.Sprint("\nStages\n\n"))
 	writer.Flush()
 	headers := []string{"Name", "Category", "Provider", "Details"}
 	fmt.Fprintf(writer, "  %s\n", strings.Join(headers, "\t"))
 	fmt.Fprintf(writer, "  %s\n", strings.Join(underline(headers), "\t"))
-	for _, stage := range p.Stages {
-		fmt.Fprint(writer, stage.HumanString())
+	for _, stage := range p.Pipeline.Stages {
+		fmt.Fprintf(writer, "  %s", stage.HumanString())
 	}
 	writer.Flush()
 	if len(p.Resources) != 0 {
 		fmt.Fprint(writer, color.Bold.Sprint("\nResources\n"))
 		writer.Flush()
 		for _, r := range p.Resources {
-			fmt.Fprint(writer, r.HumanString())
+			fmt.Fprintf(writer, "    %s", r.HumanString())
 		}
 
 	}

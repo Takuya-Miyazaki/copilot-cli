@@ -8,9 +8,20 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"os"
+	"slices"
+
+	clideploy "github.com/aws/copilot-cli/internal/pkg/cli/deploy"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/service/ssm"
+	"github.com/aws/copilot-cli/internal/pkg/aws/identity"
+	awss3 "github.com/aws/copilot-cli/internal/pkg/aws/s3"
+	"github.com/aws/copilot-cli/internal/pkg/cli/clean"
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
+	"github.com/aws/copilot-cli/internal/pkg/s3"
 
 	"github.com/aws/copilot-cli/internal/pkg/term/selector"
-	"github.com/aws/copilot-cli/internal/pkg/workspace"
 
 	awssession "github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/copilot-cli/internal/pkg/aws/ecr"
@@ -27,25 +38,19 @@ import (
 
 const (
 	svcDeleteNamePrompt              = "Which service would you like to delete?"
-	svcDeleteAppNamePrompt           = "Which application's service would you like to delete?"
 	fmtSvcDeleteConfirmPrompt        = "Are you sure you want to delete %s from application %s?"
 	fmtSvcDeleteFromEnvConfirmPrompt = "Are you sure you want to delete %s from environment %s?"
 	svcDeleteConfirmHelp             = "This will remove the service from all environments and delete it from your app."
 	svcDeleteFromEnvConfirmHelp      = "This will remove the service from just the %s environment."
 )
 
-const (
-	fmtSvcDeleteStart             = "Deleting service %s from environment %s."
-	fmtSvcDeleteFailed            = "Failed to delete service %s from environment %s: %v.\n"
-	fmtSvcDeleteComplete          = "Deleted service %s from environment %s.\n"
-	fmtSvcDeleteResourcesStart    = "Deleting resources of service %s from application %s."
-	fmtSvcDeleteResourcesFailed   = "Failed to delete resources of service %s from application %s.\n"
-	fmtSvcDeleteResourcesComplete = "Deleted resources of service %s from application %s.\n"
-)
-
 var (
 	errSvcDeleteCancelled = errors.New("svc delete cancelled - no changes made")
 )
+
+type cleaner interface {
+	Clean() error
+}
 
 type deleteSvcVars struct {
 	appName          string
@@ -58,73 +63,83 @@ type deleteSvcOpts struct {
 	deleteSvcVars
 
 	// Interfaces to dependencies.
-	store     store
-	sess      sessionProvider
-	spinner   progress
-	prompt    prompter
-	sel       wsSelector
-	appCFN    svcRemoverFromApp
-	getSvcCFN func(session *awssession.Session) wlDeleter
-	getECR    func(session *awssession.Session) imageRemover
+	store         store
+	sess          sessionProvider
+	spinner       progress
+	prompt        prompter
+	sel           configSelector
+	appCFN        svcRemoverFromApp
+	getSvcCFN     func(sess *awssession.Session) wlDeleter
+	getECR        func(sess *awssession.Session) imageRemover
+	newSvcCleaner func(sess *awssession.Session, env *config.Environment, manifestType string) cleaner
 }
 
 func newDeleteSvcOpts(vars deleteSvcVars) (*deleteSvcOpts, error) {
-	store, err := config.NewStore()
-	if err != nil {
-		return nil, fmt.Errorf("new config store: %w", err)
-	}
-
-	provider := sessions.NewProvider()
-	defaultSession, err := provider.Default()
+	sessProvider := sessions.ImmutableProvider(sessions.UserAgentExtras("svc delete"))
+	defaultSession, err := sessProvider.Default()
 	if err != nil {
 		return nil, err
 	}
-	prompter := prompt.New()
-	ws, err := workspace.New()
-	if err != nil {
-		return nil, fmt.Errorf("new workspace: %w", err)
-	}
 
-	return &deleteSvcOpts{
+	store := config.NewSSMStore(identity.New(defaultSession), ssm.New(defaultSession), aws.StringValue(defaultSession.Config.Region))
+	prompter := prompt.New()
+	opts := &deleteSvcOpts{
 		deleteSvcVars: vars,
 
 		store:   store,
 		spinner: termprogress.NewSpinner(log.DiagnosticWriter),
 		prompt:  prompter,
-		sess:    provider,
-		sel:     selector.NewWorkspaceSelect(prompter, store, ws),
-		appCFN:  cloudformation.New(defaultSession),
-		getSvcCFN: func(session *awssession.Session) wlDeleter {
-			return cloudformation.New(session)
+		sess:    sessProvider,
+		sel:     selector.NewConfigSelector(prompter, store),
+		appCFN:  cloudformation.New(defaultSession, cloudformation.WithProgressTracker(os.Stderr)),
+		getSvcCFN: func(sess *awssession.Session) wlDeleter {
+			return cloudformation.New(sess, cloudformation.WithProgressTracker(os.Stderr))
 		},
-		getECR: func(session *awssession.Session) imageRemover {
-			return ecr.New(session)
+		getECR: func(sess *awssession.Session) imageRemover {
+			return ecr.New(sess)
 		},
-	}, nil
+	}
+	opts.newSvcCleaner = func(sess *awssession.Session, env *config.Environment, manifestType string) cleaner {
+		if manifestType == manifestinfo.StaticSiteType {
+			return clean.StaticSite(opts.appName, env.Name, opts.name, s3.New(sess), awss3.New(sess))
+		}
+		return &clean.NoOp{}
+	}
+	return opts, nil
 }
 
-// Validate returns an error if the user inputs are invalid.
+// Validate returns an error for any invalid optional flags.
 func (o *deleteSvcOpts) Validate() error {
+	return nil
+}
+
+// Ask prompts for and validates any required flags.
+func (o *deleteSvcOpts) Ask() error {
+	if o.appName != "" {
+		if _, err := o.store.GetApplication(o.appName); err != nil {
+			return err
+		}
+	} else {
+		if err := o.askAppName(); err != nil {
+			return err
+		}
+	}
+
 	if o.name != "" {
 		if _, err := o.store.GetService(o.appName, o.name); err != nil {
 			return err
 		}
+	} else {
+		if err := o.askSvcName(); err != nil {
+			return err
+		}
 	}
+
 	if o.envName != "" {
-		return o.validateEnvName()
+		if err := o.validateEnvName(); err != nil {
+			return err
+		}
 	}
-	return nil
-}
-
-// Ask prompts the user for any required flags.
-func (o *deleteSvcOpts) Ask() error {
-	if err := o.askAppName(); err != nil {
-		return err
-	}
-	if err := o.askSvcName(); err != nil {
-		return err
-	}
-
 	if o.skipConfirmation {
 		return nil
 	}
@@ -143,7 +158,8 @@ func (o *deleteSvcOpts) Ask() error {
 
 	deleteConfirmed, err := o.prompt.Confirm(
 		deletePrompt,
-		deleteConfirmHelp)
+		deleteConfirmHelp,
+		prompt.WithConfirmFinalMessage())
 
 	if err != nil {
 		return fmt.Errorf("svc delete confirmation prompt: %w", err)
@@ -158,12 +174,17 @@ func (o *deleteSvcOpts) Ask() error {
 // If the service is being removed from the application, Execute will
 // also delete the ECR repository and the SSM parameter.
 func (o *deleteSvcOpts) Execute() error {
+	wkld, err := o.store.GetWorkload(o.appName, o.name)
+	if err != nil {
+		return fmt.Errorf("get workload: %w", err)
+	}
+
 	envs, err := o.appEnvironments()
 	if err != nil {
 		return err
 	}
 
-	if err := o.deleteStacks(envs); err != nil {
+	if err := o.deleteStacks(wkld.Type, envs); err != nil {
 		return err
 	}
 
@@ -183,6 +204,7 @@ func (o *deleteSvcOpts) Execute() error {
 		return err
 	}
 
+	log.Infoln()
 	log.Successf("Deleted service %s from application %s.\n", o.name, o.appName)
 
 	return nil
@@ -212,11 +234,7 @@ func (o *deleteSvcOpts) targetEnv() (*config.Environment, error) {
 }
 
 func (o *deleteSvcOpts) askAppName() error {
-	if o.appName != "" {
-		return nil
-	}
-
-	name, err := o.sel.Application(svcDeleteAppNamePrompt, "")
+	name, err := o.sel.Application(svcAppNamePrompt, wkldAppNameHelpPrompt)
 	if err != nil {
 		return fmt.Errorf("select application name: %w", err)
 	}
@@ -225,11 +243,7 @@ func (o *deleteSvcOpts) askAppName() error {
 }
 
 func (o *deleteSvcOpts) askSvcName() error {
-	if o.name != "" {
-		return nil
-	}
-
-	name, err := o.sel.Service(svcDeleteNamePrompt, "")
+	name, err := o.sel.Service(svcDeleteNamePrompt, "", o.appName)
 	if err != nil {
 		return fmt.Errorf("select service: %w", err)
 	}
@@ -255,24 +269,26 @@ func (o *deleteSvcOpts) appEnvironments() ([]*config.Environment, error) {
 	return envs, nil
 }
 
-func (o *deleteSvcOpts) deleteStacks(envs []*config.Environment) error {
+func (o *deleteSvcOpts) deleteStacks(wkldType string, envs []*config.Environment) error {
 	for _, env := range envs {
 		sess, err := o.sess.FromRole(env.ManagerRoleARN, env.Region)
 		if err != nil {
 			return err
 		}
 
+		if err := o.newSvcCleaner(sess, env, wkldType).Clean(); err != nil {
+			return fmt.Errorf("clean resources: %w", err)
+		}
+
 		cfClient := o.getSvcCFN(sess)
-		o.spinner.Start(fmt.Sprintf(fmtSvcDeleteStart, o.name, env.Name))
 		if err := cfClient.DeleteWorkload(deploy.DeleteWorkloadInput{
-			Name:    o.name,
-			EnvName: env.Name,
-			AppName: o.appName,
+			Name:             o.name,
+			EnvName:          env.Name,
+			AppName:          o.appName,
+			ExecutionRoleARN: env.ExecutionRoleARN,
 		}); err != nil {
-			o.spinner.Stop(log.Serrorf(fmtSvcDeleteFailed, o.name, env.Name, err))
 			return fmt.Errorf("delete service: %w", err)
 		}
-		o.spinner.Stop(log.Ssuccessf(fmtSvcDeleteComplete, o.name, env.Name))
 	}
 	return nil
 }
@@ -281,13 +297,13 @@ func (o *deleteSvcOpts) deleteStacks(envs []*config.Environment) error {
 func (o *deleteSvcOpts) emptyECRRepos(envs []*config.Environment) error {
 	var uniqueRegions []string
 	for _, env := range envs {
-		if !contains(env.Region, uniqueRegions) {
+		if !slices.Contains(uniqueRegions, env.Region) {
 			uniqueRegions = append(uniqueRegions, env.Region)
 		}
 	}
 
 	// TODO: centralized ECR repo name
-	repoName := fmt.Sprintf("%s/%s", o.appName, o.name)
+	repoName := clideploy.RepoName(o.appName, o.name)
 	for _, region := range uniqueRegions {
 		sess, err := o.sess.DefaultWithRegion(region)
 		if err != nil {
@@ -307,14 +323,11 @@ func (o *deleteSvcOpts) removeSvcFromApp() error {
 		return err
 	}
 
-	o.spinner.Start(fmt.Sprintf(fmtSvcDeleteResourcesStart, o.name, o.appName))
 	if err := o.appCFN.RemoveServiceFromApp(proj, o.name); err != nil {
 		if !isStackSetNotExistsErr(err) {
-			o.spinner.Stop(log.Serrorf(fmtSvcDeleteResourcesFailed, o.name, o.appName))
 			return err
 		}
 	}
-	o.spinner.Stop(log.Ssuccessf(fmtSvcDeleteResourcesComplete, o.name, o.appName))
 	return nil
 }
 
@@ -326,12 +339,13 @@ func (o *deleteSvcOpts) deleteSSMParam() error {
 	return nil
 }
 
-// RecommendedActions returns follow-up actions the user can take after successfully executing the command.
-func (o *deleteSvcOpts) RecommendedActions() []string {
-	return []string{
+// RecommendActions returns follow-up actions the user can take after successfully executing the command.
+func (o *deleteSvcOpts) RecommendActions() error {
+	logRecommendedActions([]string{
 		fmt.Sprintf("Run %s to update the corresponding pipeline if it exists.",
-			color.HighlightCode("copilot pipeline update")),
-	}
+			color.HighlightCode("copilot pipeline deploy")),
+	})
+	return nil
 }
 
 // buildSvcDeleteCmd builds the command to delete application(s).
@@ -357,21 +371,7 @@ func buildSvcDeleteCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := opts.Validate(); err != nil {
-				return err
-			}
-			if err := opts.Ask(); err != nil {
-				return err
-			}
-			if err := opts.Execute(); err != nil {
-				return err
-			}
-
-			log.Infoln("Recommended follow-up actions:")
-			for _, followup := range opts.RecommendedActions() {
-				log.Infof("- %s\n", followup)
-			}
-			return nil
+			return run(opts)
 		}),
 	}
 

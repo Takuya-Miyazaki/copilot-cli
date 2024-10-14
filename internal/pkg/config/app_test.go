@@ -113,7 +113,7 @@ func TestStore_ListApplications(t *testing.T) {
 			// GIVEN
 			lastPageInPaginatedResp = false
 			store := &Store{
-				ssmClient: &mockSSM{
+				ssm: &mockSSM{
 					t:                       t,
 					mockGetParametersByPath: tc.mockGetParametersByPath,
 				},
@@ -219,14 +219,14 @@ func TestStore_GetApplication(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			// GIVEN
 			store := &Store{
-				ssmClient: &mockSSM{
+				ssm: &mockSSM{
 					t:                t,
 					mockGetParameter: tc.mockGetParameter,
 				},
-				idClient: mockIdentityService{
+				sts: mockIdentityService{
 					mockIdentityServiceGet: tc.mockIdentityServiceGet,
 				},
-				sessionRegion: "us-west-2",
+				appRegion: "us-west-2",
 			}
 
 			// WHEN
@@ -243,6 +243,12 @@ func TestStore_GetApplication(t *testing.T) {
 }
 
 func TestStore_CreateApplication(t *testing.T) {
+	tagForApplicationParam := []*ssm.Tag{
+		{
+			Key:   aws.String("copilot-application"),
+			Value: aws.String("phonetool"),
+		},
+	}
 	testCases := map[string]struct {
 		inApplication *Application
 
@@ -250,11 +256,11 @@ func TestStore_CreateApplication(t *testing.T) {
 		wantedErr        error
 	}{
 		"with no existing application": {
-			inApplication: &Application{Name: "phonetool", AccountID: "1234", Domain: "phonetool.com", Tags: map[string]string{"owner": "boss"}},
+			inApplication: &Application{Name: "phonetool", AccountID: "1234", Domain: "phonetool.com", DomainHostedZoneID: "mockHostedZoneID", Tags: map[string]string{"owner": "boss"}},
 			mockPutParameter: func(t *testing.T, param *ssm.PutParameterInput) (*ssm.PutParameterOutput, error) {
 				require.Equal(t, fmt.Sprintf(fmtApplicationPath, "phonetool"), *param.Name)
-				require.Equal(t, fmt.Sprintf(`{"name":"phonetool","account":"1234","domain":"phonetool.com","version":"%s","tags":{"owner":"boss"}}`, schemaVersion), *param.Value)
-
+				require.Equal(t, fmt.Sprintf(`{"name":"phonetool","account":"1234","domain":"phonetool.com","domainHostedZoneID":"mockHostedZoneID","version":"%s","tags":{"owner":"boss"}}`, schemaVersion), *param.Value)
+				require.Equal(t, tagForApplicationParam, param.Tags)
 				return &ssm.PutParameterOutput{
 					Version: aws.Int64(1),
 				}, nil
@@ -264,6 +270,7 @@ func TestStore_CreateApplication(t *testing.T) {
 		"with existing application": {
 			inApplication: &Application{Name: "phonetool", AccountID: "1234"},
 			mockPutParameter: func(t *testing.T, param *ssm.PutParameterInput) (*ssm.PutParameterOutput, error) {
+				require.Equal(t, tagForApplicationParam, param.Tags)
 				return nil, awserr.New(ssm.ErrCodeParameterAlreadyExists, "Already exists", fmt.Errorf("Already Exists"))
 			},
 			wantedErr: nil,
@@ -271,6 +278,7 @@ func TestStore_CreateApplication(t *testing.T) {
 		"with SSM error": {
 			inApplication: &Application{Name: "phonetool", AccountID: "1234"},
 			mockPutParameter: func(t *testing.T, param *ssm.PutParameterInput) (*ssm.PutParameterOutput, error) {
+				require.Equal(t, tagForApplicationParam, param.Tags)
 				return nil, fmt.Errorf("broken")
 			},
 			wantedErr: fmt.Errorf("create application phonetool: broken"),
@@ -280,7 +288,7 @@ func TestStore_CreateApplication(t *testing.T) {
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
 			store := &Store{
-				ssmClient: &mockSSM{
+				ssm: &mockSSM{
 					t:                t,
 					mockPutParameter: tc.mockPutParameter,
 				},
@@ -288,6 +296,55 @@ func TestStore_CreateApplication(t *testing.T) {
 
 			// WHEN
 			err := store.CreateApplication(tc.inApplication)
+
+			// THEN
+			if tc.wantedErr != nil {
+				require.EqualError(t, err, tc.wantedErr.Error())
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+func TestStore_UpdateApplication(t *testing.T) {
+	testCases := map[string]struct {
+		inApplication *Application
+
+		mockPutParameter func(t *testing.T, param *ssm.PutParameterInput) (*ssm.PutParameterOutput, error)
+		wantedErr        error
+	}{
+		"success": {
+			inApplication: &Application{Name: "phonetool", AccountID: "1234", Domain: "phonetool.com", DomainHostedZoneID: "mockHostedZoneID", Tags: map[string]string{"owner": "boss"}},
+			mockPutParameter: func(t *testing.T, param *ssm.PutParameterInput) (*ssm.PutParameterOutput, error) {
+				require.Equal(t, fmt.Sprintf(fmtApplicationPath, "phonetool"), *param.Name)
+				require.Equal(t, fmt.Sprintf(`{"name":"phonetool","account":"1234","domain":"phonetool.com","domainHostedZoneID":"mockHostedZoneID","version":"%s","tags":{"owner":"boss"}}`, schemaVersion), *param.Value)
+
+				return &ssm.PutParameterOutput{
+					Version: aws.Int64(1),
+				}, nil
+			},
+			wantedErr: nil,
+		},
+		"with SSM error": {
+			inApplication: &Application{Name: "phonetool", AccountID: "1234"},
+			mockPutParameter: func(t *testing.T, param *ssm.PutParameterInput) (*ssm.PutParameterOutput, error) {
+				return nil, fmt.Errorf("broken")
+			},
+			wantedErr: fmt.Errorf("update application phonetool: broken"),
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			store := &Store{
+				ssm: &mockSSM{
+					t:                t,
+					mockPutParameter: tc.mockPutParameter,
+				},
+			}
+
+			// WHEN
+			err := store.UpdateApplication(tc.inApplication)
 
 			// THEN
 			if tc.wantedErr != nil {
@@ -337,7 +394,7 @@ func TestDeleteApplication(t *testing.T) {
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
 			store := &Store{
-				ssmClient: &mockSSM{
+				ssm: &mockSSM{
 					t:                   t,
 					mockDeleteParameter: test.mockDeleteParameter,
 				},

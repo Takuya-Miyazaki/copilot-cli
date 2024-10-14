@@ -10,6 +10,27 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestURLSafeVersionFunc(t *testing.T) {
+	testCases := map[string]struct {
+		in     string
+		wanted string
+	}{
+		"no plus": {
+			in:     "v1.29.0",
+			wanted: "v1.29.0",
+		},
+		"has plus": {
+			in:     "v1.29.0+5-g74ef584b3",
+			wanted: "v1.29.0%2B5-g74ef584b3",
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			require.Equal(t, tc.wanted, URLSafeVersion(tc.in))
+		})
+	}
+}
+
 func TestReplaceDashesFunc(t *testing.T) {
 	testCases := map[string]struct {
 		in     string
@@ -225,9 +246,92 @@ func TestQuoteSliceFunc(t *testing.T) {
 	}
 }
 
-func TestQuotePSliceFunc(t *testing.T) {
-	require.Equal(t, []string(nil), QuotePSliceFunc(nil))
-	require.Equal(t, []string(nil), QuotePSliceFunc([]*string{}))
-	require.Equal(t, []string{`"a"`}, QuotePSliceFunc(aws.StringSlice([]string{"a"})))
-	require.Equal(t, []string{`"a"`, `"b"`, `"c"`}, QuotePSliceFunc(aws.StringSlice([]string{"a", "b", "c"})))
+func TestGenerateMountPointJSON(t *testing.T) {
+	require.Equal(t, `{"myEFSVolume":"/var/www"}`, generateMountPointJSON([]*MountPoint{{ContainerPath: aws.String("/var/www"), SourceVolume: aws.String("myEFSVolume")}}), "JSON should render correctly")
+	require.Equal(t, "{}", generateMountPointJSON([]*MountPoint{}), "nil list of arguments should render ")
+	require.Equal(t, "{}", generateMountPointJSON([]*MountPoint{{SourceVolume: aws.String("fromEFS")}}), "empty paths should not get injected")
+}
+
+func TestGenerateSNSJSON(t *testing.T) {
+	testCases := map[string]struct {
+		in     []*Topic
+		wanted string
+	}{
+		"JSON should render correctly": {
+			in: []*Topic{
+				{
+					Name:      aws.String("tests"),
+					AccountID: "123456789012",
+					Region:    "us-west-2",
+					Partition: "aws",
+					App:       "appName",
+					Env:       "envName",
+					Svc:       "svcName",
+				},
+			},
+			wanted: `{"tests":"arn:aws:sns:us-west-2:123456789012:appName-envName-svcName-tests"}`,
+		},
+		"Topics with no names show empty": {
+			in: []*Topic{
+				{
+					AccountID: "123456789012",
+					Region:    "us-west-2",
+					Partition: "aws",
+					App:       "appName",
+					Env:       "envName",
+					Svc:       "svcName",
+				},
+			},
+			wanted: `{}`,
+		},
+		"nil list of arguments should render": {
+			in:     []*Topic{},
+			wanted: `{}`,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			require.Equal(t, tc.wanted, generateSNSJSON(tc.in))
+		})
+	}
+}
+
+func TestGenerateQueueURIJSON(t *testing.T) {
+	testCases := map[string]struct {
+		in              []*TopicSubscription
+		wanted          string
+		wantedSubstring string
+	}{
+		"JSON should render correctly": {
+			in: []*TopicSubscription{
+				{
+					Name:    aws.String("tests"),
+					Service: aws.String("bestsvc"),
+					Queue: &SQSQueue{
+						Delay: aws.Int64(5),
+					},
+				},
+			},
+			wantedSubstring: `"bestsvcTestsEventsQueue":"${bestsvctestsURL}"`,
+		},
+		"Topics with no names show empty but main queue still populates": {
+			in: []*TopicSubscription{
+				{
+					Service: aws.String("bestSvc"),
+				},
+			},
+			wanted: `{}`,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			if tc.wanted != "" {
+				require.Equal(t, generateQueueURIJSON(tc.in), tc.wanted)
+			} else {
+				require.Contains(t, generateQueueURIJSON(tc.in), tc.wantedSubstring)
+			}
+		})
+	}
 }

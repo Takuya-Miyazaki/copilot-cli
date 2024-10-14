@@ -24,13 +24,17 @@ func TestPackageJobOpts_Validate(t *testing.T) {
 		inEnvName string
 		inJobName string
 
+		inShowDiff     bool
+		inOutputDir    string
+		inUploadAssets bool
+
 		setupMocks func()
 
 		wantedErrorS string
 	}{
 		"invalid workspace": {
 			setupMocks: func() {
-				mockWorkspace.EXPECT().JobNames().Times(0)
+				mockWorkspace.EXPECT().ListJobs().Times(0)
 				mockStore.EXPECT().GetEnvironment(gomock.Any(), gomock.Any()).Times(0)
 			},
 			wantedErrorS: "could not find an application attached to this workspace, please run `app init` first",
@@ -39,7 +43,7 @@ func TestPackageJobOpts_Validate(t *testing.T) {
 			inAppName: "phonetool",
 			inJobName: "resizer",
 			setupMocks: func() {
-				mockWorkspace.EXPECT().JobNames().Return(nil, errors.New("some error"))
+				mockWorkspace.EXPECT().ListJobs().Return(nil, errors.New("some error"))
 				mockStore.EXPECT().GetEnvironment(gomock.Any(), gomock.Any()).Times(0)
 			},
 
@@ -49,7 +53,7 @@ func TestPackageJobOpts_Validate(t *testing.T) {
 			inAppName: "phonetool",
 			inJobName: "resizer",
 			setupMocks: func() {
-				mockWorkspace.EXPECT().JobNames().Return([]string{"other-job"}, nil)
+				mockWorkspace.EXPECT().ListJobs().Return([]string{"other-job"}, nil)
 				mockStore.EXPECT().GetEnvironment(gomock.Any(), gomock.Any()).Times(0)
 			},
 
@@ -60,7 +64,7 @@ func TestPackageJobOpts_Validate(t *testing.T) {
 			inEnvName: "test",
 
 			setupMocks: func() {
-				mockWorkspace.EXPECT().JobNames().Times(0)
+				mockWorkspace.EXPECT().ListJobs().Times(0)
 				mockStore.EXPECT().GetEnvironment("phonetool", "test").Return(nil, &config.ErrNoSuchEnvironment{
 					ApplicationName: "phonetool",
 					EnvironmentName: "test",
@@ -90,6 +94,10 @@ func TestPackageJobOpts_Validate(t *testing.T) {
 					name:    tc.inJobName,
 					envName: tc.inEnvName,
 					appName: tc.inAppName,
+
+					showDiff:     tc.inShowDiff,
+					outputDir:    tc.inOutputDir,
+					uploadAssets: tc.inUploadAssets,
 				},
 				ws:    mockWorkspace,
 				store: mockStore,
@@ -113,36 +121,26 @@ func TestPackageJobOpts_Ask(t *testing.T) {
 	testCases := map[string]struct {
 		inJobName string
 		inEnvName string
-		inTag     string
 
 		expectSelector func(m *mocks.MockwsSelector)
 		expectPrompt   func(m *mocks.Mockprompter)
-		expectRunner   func(m *mocks.Mockrunner)
 
 		wantedJobName string
 		wantedEnvName string
-		wantedTag     string
 		wantedErrorS  string
 	}{
 		"prompt for all options": {
-			expectRunner: func(m *mocks.Mockrunner) {
-				m.EXPECT().Run(gomock.Any(), gomock.Any(), gomock.Any()).Return(errors.New("not a git repo"))
-			},
 			expectSelector: func(m *mocks.MockwsSelector) {
 				m.EXPECT().Job(jobPackageJobNamePrompt, "").Return("resizer", nil)
 				m.EXPECT().Environment(jobPackageEnvNamePrompt, "", testAppName).Return("test", nil)
 			},
-			expectPrompt: func(m *mocks.Mockprompter) {
-				m.EXPECT().Get(inputImageTagPrompt, "", gomock.Any()).Return("v1.0.0", nil)
-			},
+			expectPrompt: func(m *mocks.Mockprompter) {},
 
 			wantedJobName: "resizer",
 			wantedEnvName: "test",
-			wantedTag:     "v1.0.0",
 		},
 		"prompt only for the job name": {
 			inEnvName: "test",
-			inTag:     "v1.0.0",
 
 			expectSelector: func(m *mocks.MockwsSelector) {
 				m.EXPECT().Job(jobPackageJobNamePrompt, "").Return("resizer", nil)
@@ -151,15 +149,12 @@ func TestPackageJobOpts_Ask(t *testing.T) {
 			expectPrompt: func(m *mocks.Mockprompter) {
 				m.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
 			},
-			expectRunner: func(m *mocks.Mockrunner) {},
 
 			wantedJobName: "resizer",
 			wantedEnvName: "test",
-			wantedTag:     "v1.0.0",
 		},
 		"prompt only for the env name": {
 			inJobName: "resizer",
-			inTag:     "v1.0.0",
 
 			expectSelector: func(m *mocks.MockwsSelector) {
 				m.EXPECT().Job(gomock.Any(), gomock.Any()).Times(0)
@@ -168,16 +163,13 @@ func TestPackageJobOpts_Ask(t *testing.T) {
 			expectPrompt: func(m *mocks.Mockprompter) {
 				m.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
 			},
-			expectRunner: func(m *mocks.Mockrunner) {},
 
 			wantedJobName: "resizer",
 			wantedEnvName: "test",
-			wantedTag:     "v1.0.0",
 		},
 		"don't prompt": {
 			inJobName: "resizer",
 			inEnvName: "test",
-			inTag:     "v1.0.0",
 
 			expectSelector: func(m *mocks.MockwsSelector) {
 				m.EXPECT().Job(gomock.Any(), gomock.Any()).Times(0)
@@ -186,11 +178,9 @@ func TestPackageJobOpts_Ask(t *testing.T) {
 			expectPrompt: func(m *mocks.Mockprompter) {
 				m.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
 			},
-			expectRunner: func(m *mocks.Mockrunner) {},
 
 			wantedJobName: "resizer",
 			wantedEnvName: "test",
-			wantedTag:     "v1.0.0",
 		},
 	}
 
@@ -202,17 +192,15 @@ func TestPackageJobOpts_Ask(t *testing.T) {
 
 			mockSelector := mocks.NewMockwsSelector(ctrl)
 			mockPrompt := mocks.NewMockprompter(ctrl)
-			mockRunner := mocks.NewMockrunner(ctrl)
+			mockRunner := mocks.NewMockexecRunner(ctrl)
 
 			tc.expectSelector(mockSelector)
 			tc.expectPrompt(mockPrompt)
-			tc.expectRunner(mockRunner)
 
 			opts := &packageJobOpts{
 				packageJobVars: packageJobVars{
 					name:    tc.inJobName,
 					envName: tc.inEnvName,
-					tag:     tc.inTag,
 					appName: testAppName,
 				},
 				sel:    mockSelector,
@@ -226,7 +214,6 @@ func TestPackageJobOpts_Ask(t *testing.T) {
 			// THEN
 			require.Equal(t, tc.wantedJobName, opts.name)
 			require.Equal(t, tc.wantedEnvName, opts.envName)
-			require.Equal(t, tc.wantedTag, opts.tag)
 
 			if tc.wantedErrorS != "" {
 				require.EqualError(t, err, tc.wantedErrorS)
@@ -277,6 +264,42 @@ func TestPackageJobOpts_Execute(t *testing.T) {
 
 			// WHEN
 			err := opts.Execute()
+
+			// THEN
+			require.Equal(t, tc.wantedErr, err)
+		})
+	}
+}
+
+func TestPackageJobOpts_RecommendActions(t *testing.T) {
+	testCases := map[string]struct {
+		mockDependencies func(*gomock.Controller, *packageJobOpts)
+
+		wantedErr error
+	}{
+		"reuse svc package RecommandActions": {
+			mockDependencies: func(ctrl *gomock.Controller, opts *packageJobOpts) {
+				mockCmd := mocks.NewMockactionCommand(ctrl)
+				mockCmd.EXPECT().RecommendActions().Return(nil)
+				opts.packageCmd = mockCmd
+			},
+			wantedErr: nil,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			// GIVEN
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
+			opts := &packageJobOpts{
+				packageCmd: mocks.NewMockactionCommand(ctrl),
+			}
+			tc.mockDependencies(ctrl, opts)
+
+			// WHEN
+			err := opts.RecommendActions()
 
 			// THEN
 			require.Equal(t, tc.wantedErr, err)

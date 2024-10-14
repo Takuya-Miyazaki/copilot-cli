@@ -9,6 +9,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/aws/copilot-cli/internal/pkg/manifest/manifestinfo"
+	"github.com/aws/copilot-cli/internal/pkg/workspace"
+
 	"github.com/spf13/afero"
 
 	"github.com/stretchr/testify/require"
@@ -34,7 +37,7 @@ var basicNameTestCases = map[string]testCase{
 	},
 	"string with invalid characters": {
 		input: "myProject!",
-		want:  errValueBadFormat,
+		want:  errBasicNameRegexNotMatched,
 	},
 	"empty string": {
 		input: "",
@@ -46,26 +49,26 @@ var basicNameTestCases = map[string]testCase{
 	},
 	"does not start with letter": {
 		input: "123chicken",
-		want:  errValueBadFormat,
+		want:  errBasicNameRegexNotMatched,
 	},
 	"contains upper-case letters": {
 		input: "badGoose",
-		want:  errValueBadFormat,
+		want:  errBasicNameRegexNotMatched,
 	},
 }
 
-func TestValidateProjectName(t *testing.T) {
+func TestValidateAppName(t *testing.T) {
 	// Any project-specific name validations can be added here
 	testCases := map[string]testCase{
 		"contains emoji": {
 			input: "😀",
-			want:  errValueBadFormat,
+			want:  errBasicNameRegexNotMatched,
 		},
 	}
 
 	for name, tc := range basicNameTestCases {
 		t.Run(name, func(t *testing.T) {
-			got := validateAppName(tc.input)
+			got := validateAppNameString(tc.input)
 
 			require.True(t, errors.Is(got, tc.want))
 		})
@@ -73,7 +76,7 @@ func TestValidateProjectName(t *testing.T) {
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			got := validateAppName(tc.input)
+			got := validateAppNameString(tc.input)
 
 			require.True(t, errors.Is(got, tc.want))
 		})
@@ -81,13 +84,57 @@ func TestValidateProjectName(t *testing.T) {
 }
 
 func TestValidateSvcName(t *testing.T) {
-	testCases := basicNameTestCases
+	testCases := map[string]struct {
+		val     interface{}
+		svcType string
+
+		wanted error
+	}{
+		"string as input": {
+			val:     "hello",
+			svcType: manifestinfo.LoadBalancedWebServiceType,
+			wanted:  nil,
+		},
+		"number as input": {
+			val:    1234,
+			wanted: errValueNotAString,
+		},
+		"string with invalid characters": {
+			val:    "mySvc!",
+			wanted: errBasicNameRegexNotMatched,
+		},
+		"longer than 40 characters for app runner services": {
+			val:     strings.Repeat("x", 41),
+			svcType: manifestinfo.RequestDrivenWebServiceType,
+			wanted:  errAppRunnerSvcNameTooLong,
+		},
+		"invalid length string": {
+			val:     strings.Repeat("s", 256),
+			svcType: manifestinfo.LoadBalancedWebServiceType,
+			wanted:  errValueTooLong,
+		},
+		"does not start with letter": {
+			val:     "123chicken",
+			svcType: manifestinfo.BackendServiceType,
+			wanted:  errBasicNameRegexNotMatched,
+		},
+		"contains upper-case letters": {
+			val:     "badGoose",
+			svcType: manifestinfo.LoadBalancedWebServiceType,
+			wanted:  errBasicNameRegexNotMatched,
+		},
+		"is not a reserved name": {
+			val:     "pipelines",
+			svcType: manifestinfo.LoadBalancedWebServiceType,
+			wanted:  errValueReserved,
+		},
+	}
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			got := validateSvcName(tc.input)
+			got := validateSvcName(tc.val, tc.svcType)
 
-			require.True(t, errors.Is(got, tc.want))
+			require.True(t, errors.Is(got, tc.wanted), "got %v instead of %v", got, tc.wanted)
 		})
 	}
 }
@@ -97,9 +144,66 @@ func TestValidateEnvironmentName(t *testing.T) {
 
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			got := validateSvcName(tc.input)
+			got := validateEnvironmentName(tc.input)
 
 			require.True(t, errors.Is(got, tc.want))
+		})
+	}
+}
+
+func TestValidatePipelineName(t *testing.T) {
+	testCases := map[string]struct {
+		val     interface{}
+		appName string
+
+		wanted            error
+		wantedErrorSuffix string
+	}{
+		"string as input": {
+			val:    "hello",
+			wanted: nil,
+		},
+		"number as input": {
+			val:    1234,
+			wanted: errValueNotAString,
+		},
+		"string with invalid characters": {
+			val:    "myPipe!",
+			wanted: errBasicNameRegexNotMatched,
+		},
+		"longer than 128 characters": {
+			val:               strings.Repeat("s", 129),
+			wantedErrorSuffix: fmt.Sprintf(fmtErrPipelineNameTooLong, 118),
+		},
+		"longer than 128 characters with pipeline-[app]": {
+			val:               strings.Repeat("x", 114),
+			appName:           "myApp",
+			wantedErrorSuffix: fmt.Sprintf(fmtErrPipelineNameTooLong, 113),
+		},
+		"does not start with letter": {
+			val:    "123chicken",
+			wanted: errBasicNameRegexNotMatched,
+		},
+		"starts with a dash": {
+			val:    "-beta",
+			wanted: errBasicNameRegexNotMatched,
+		},
+		"contains upper-case letters": {
+			val:    "badGoose",
+			wanted: errBasicNameRegexNotMatched,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			got := validatePipelineName(tc.val, tc.appName)
+
+			if tc.wantedErrorSuffix != "" {
+				require.True(t, strings.HasSuffix(got.Error(), tc.wantedErrorSuffix), "got %v instead of %v", got, tc.wantedErrorSuffix)
+				return
+			}
+
+			require.True(t, errors.Is(got, tc.wanted), "got %v instead of %v", got, tc.wanted)
 		})
 	}
 }
@@ -193,6 +297,31 @@ func TestValidateDDBName(t *testing.T) {
 	}
 }
 
+func TestValidateRDSName(t *testing.T) {
+	testCases := map[string]testCase{
+		"good case": {
+			input: "goodname",
+			want:  nil,
+		},
+		"too long": {
+			input: "AprilisthecruellestmonthbreedingLilacsoutofthedeadlanda",
+			want:  fmt.Errorf("value must be between 1 and %d characters in length", 63-len("DBCluster")),
+		},
+		"bad character": {
+			input: "not-good!",
+			want:  errInvalidRDSNameCharacters,
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			got := rdsNameValidation(tc.input)
+			if tc.want != nil {
+				require.EqualError(t, got, tc.want.Error())
+			}
+		})
+	}
+}
+
 func TestValidatePath(t *testing.T) {
 	testCases := map[string]struct {
 		input interface{}
@@ -243,31 +372,95 @@ func TestValidatePath(t *testing.T) {
 	}
 }
 
+type mockManifestReader struct {
+	out workspace.WorkloadManifest
+	err error
+}
+
+func (m mockManifestReader) ReadWorkloadManifest(name string) (workspace.WorkloadManifest, error) {
+	return m.out, m.err
+}
+
 func TestValidateStorageType(t *testing.T) {
 	testCases := map[string]struct {
-		input string
-		want  error
+		input     string
+		optionals validateStorageTypeOpts
+		want      error
 	}{
-		"S3 okay": {
+		"should allow S3 addons": {
 			input: "S3",
 			want:  nil,
 		},
-		"DDB okay": {
+		"should allow DynamoDB allows": {
 			input: "DynamoDB",
 			want:  nil,
 		},
-		"Bad name": {
+		"should return an error if a storage type does not exist": {
 			input: "Dropbox",
 			want:  fmt.Errorf(fmtErrInvalidStorageType, "Dropbox", prettify(storageTypes)),
+		},
+		"should allow Aurora if workload name is not yet specified": {
+			input: "Aurora",
+			want:  nil,
+		},
+		"should return an error if manifest file cannot be read while initializing an Aurora storage type": {
+			input: "Aurora",
+			optionals: validateStorageTypeOpts{
+				ws: mockManifestReader{
+					err: errors.New("some error"),
+				},
+				workloadName: "api",
+			},
+			want: errors.New("invalid storage type Aurora: read manifest file for api: some error"),
+		},
+		"should allow Aurora if the workload type is not a RDWS": {
+			input: "Aurora",
+			optionals: validateStorageTypeOpts{
+				ws: mockManifestReader{
+					out: []byte(`
+name: api
+type: Load Balanced Web Service
+`),
+				},
+				workloadName: "api",
+			},
+		},
+		"should return an error if Aurora is selected for a RDWS while not connected to a VPC": {
+			input: "Aurora",
+			optionals: validateStorageTypeOpts{
+				ws: mockManifestReader{
+					out: []byte(`
+name: api
+type: Request-Driven Web Service
+`),
+				},
+				workloadName: "api",
+			},
+			want: errors.New("invalid storage type Aurora: Request-Driven Web Service requires a VPC connection"),
+		},
+		"should succeed if Aurora is selected and RDWS is connected to a VPC": {
+			input: "Aurora",
+			optionals: validateStorageTypeOpts{
+				ws: mockManifestReader{
+					out: []byte(`
+name: api
+type: Request-Driven Web Service
+network:
+  vpc:
+    placement: private
+`),
+				},
+				workloadName: "api",
+			},
 		},
 	}
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			got := validateStorageType(tc.input)
+			got := validateStorageType(tc.input, tc.optionals)
 			if tc.want == nil {
-				require.Nil(t, got)
+				require.NoError(t, got)
 			} else {
-				require.EqualError(t, tc.want, got.Error())
+				require.EqualError(t, got, tc.want.Error())
 			}
 		})
 	}
@@ -357,31 +550,71 @@ func TestValidateCIDR(t *testing.T) {
 	}
 }
 
-func TestValidateCIDRSlice(t *testing.T) {
+func Test_validatePublicSubnetsCIDR(t *testing.T) {
 	testCases := map[string]struct {
-		inputCIDRSlice string
-		wantError      error
+		in     string
+		numAZs int
+
+		wantedErr string
 	}{
-		"good case": {
-			inputCIDRSlice: "10.10.10.10/24,10.10.10.10/24",
-			wantError:      nil,
+		"returns nil if CIDRs are valid and match number of available AZs": {
+			in:     "10.10.10.10/24,10.10.10.10/24",
+			numAZs: 2,
 		},
-		"bad case": {
-			inputCIDRSlice: "mockBadInput",
-			wantError:      errValueNotIPNetSlice,
+		"returns err if number of CIDRs is not equal to number of available AZs": {
+			in:        "10.10.10.10/24,10.10.10.10/24",
+			numAZs:    3,
+			wantedErr: "number of public subnet CIDRs (2) does not match number of AZs (3)",
 		},
-		"bad IPNet case": {
-			inputCIDRSlice: "10.10.10.10,10.10.10.10",
-			wantError:      errValueNotIPNetSlice,
+		"returns err if input is not valid CIDR fmt": {
+			in:        "10.10.10.10,10.10.10.10",
+			numAZs:    2,
+			wantedErr: errValueNotIPNetSlice.Error(),
 		},
 	}
+
 	for name, tc := range testCases {
 		t.Run(name, func(t *testing.T) {
-			got := validateCIDRSlice(tc.inputCIDRSlice)
-			if tc.wantError != nil {
-				require.EqualError(t, got, tc.wantError.Error())
+			actual := validatePublicSubnetsCIDR(tc.numAZs)(tc.in)
+			if tc.wantedErr == "" {
+				require.NoError(t, actual)
 			} else {
-				require.Nil(t, got)
+				require.EqualError(t, actual, tc.wantedErr)
+			}
+		})
+	}
+}
+
+func Test_validatePrivateSubnetsCIDR(t *testing.T) {
+	testCases := map[string]struct {
+		in     string
+		numAZs int
+
+		wantedErr string
+	}{
+		"returns nil if CIDRs are valid and match number of available AZs": {
+			in:     "10.10.10.10/24,10.10.10.10/24",
+			numAZs: 2,
+		},
+		"returns err if number of CIDRs is not equal to number of available AZs": {
+			in:        "10.10.10.10/24,10.10.10.10/24",
+			numAZs:    3,
+			wantedErr: "number of private subnet CIDRs (2) does not match number of AZs (3)",
+		},
+		"returns err if input is not valid CIDR fmt": {
+			in:        "10.10.10.10,10.10.10.10",
+			numAZs:    2,
+			wantedErr: errValueNotIPNetSlice.Error(),
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			actual := validatePrivateSubnetsCIDR(tc.numAZs)(tc.in)
+			if tc.wantedErr == "" {
+				require.NoError(t, actual)
+			} else {
+				require.EqualError(t, actual, tc.wantedErr)
 			}
 		})
 	}
@@ -418,6 +651,14 @@ func TestIsCorrectFormat(t *testing.T) {
 		},
 		"contains capital letter": {
 			input:   "badGoose",
+			isLegit: false,
+		},
+		"contains consecutive dashes": {
+			input:   "bad--goose",
+			isLegit: false,
+		},
+		"contains trailing dash": {
+			input:   "badgoose-",
 			isLegit: false,
 		},
 	}
@@ -469,6 +710,266 @@ func TestValidateCron(t *testing.T) {
 			} else {
 				require.NotNil(t, got)
 			}
+		})
+	}
+}
+
+func TestValidateEngine(t *testing.T) {
+	testCases := map[string]testCase{
+		"mysql": {
+			input: "MySQL",
+			want:  nil,
+		},
+		"postgresql": {
+			input: "PostgreSQL",
+			want:  nil,
+		},
+		"invalid engine type": {
+			input: "weird-engine",
+			want:  errors.New("invalid engine type weird-engine: must be one of \"MySQL\", \"PostgreSQL\""),
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			got := validateEngine(tc.input)
+			if tc.want != nil {
+				require.EqualError(t, got, tc.want.Error())
+			} else {
+				require.NoError(t, got)
+			}
+		})
+	}
+}
+
+func TestValidateMySQLDBName(t *testing.T) {
+	testCases := map[string]testCase{
+		"good case": {
+			input: "my_db_123_",
+			want:  nil,
+		},
+		"too long": {
+			input: "April-is-the-cruellest-month-breeding-Lilacs-out-of-the-dead-land-m",
+			want:  errors.New("value must be between 1 and 64 characters in length"),
+		},
+		"bad character": {
+			input: "bad_db_name:(",
+			want:  fmt.Errorf(fmtErrInvalidDBNameCharacters, "bad_db_name:("),
+		},
+		"bad starting character": {
+			input: "_not_good",
+			want:  fmt.Errorf(fmtErrInvalidDBNameCharacters, "_not_good"),
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			got := validateMySQLDBName(tc.input)
+			if tc.want != nil {
+				require.EqualError(t, got, tc.want.Error())
+			} else {
+				require.NoError(t, got)
+			}
+		})
+	}
+}
+
+func TestValidatePostgreSQLDBName(t *testing.T) {
+	testCases := map[string]testCase{
+		"good case": {
+			input: "my_db_123_",
+			want:  nil,
+		},
+		"too long": {
+			input: "April-is-the-cruellest-month-breeding-Lilacs-out-of-the-dead-land-m",
+			want:  errors.New("value must be between 1 and 63 characters in length"),
+		},
+		"bad character": {
+			input: "bad_db_name:(",
+			want:  fmt.Errorf(fmtErrInvalidDBNameCharacters, "bad_db_name:("),
+		},
+		"bad starting character": {
+			input: "_not_good",
+			want:  fmt.Errorf(fmtErrInvalidDBNameCharacters, "_not_good"),
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			got := validatePostgreSQLDBName(tc.input)
+			if tc.want != nil {
+				require.EqualError(t, got, tc.want.Error())
+			} else {
+				require.NoError(t, got)
+			}
+		})
+	}
+}
+
+func TestValidateSecretName(t *testing.T) {
+	testCases := map[string]testCase{
+		"bad character": {
+			input: "bad!",
+			want:  errInvalidSecretNameCharacters,
+		},
+		"bad character space": {
+			input: "bad ",
+			want:  errInvalidSecretNameCharacters,
+		},
+		"secret name too short": {
+			input: "",
+			want:  fmt.Errorf(fmtErrValueBadSize, 1, 2048-(len("/copilot/")+len("/")+len("/secrets/"))),
+		},
+		"secret name too long": {
+			input: string(make([]rune, 2048)),
+			want:  fmt.Errorf(fmtErrValueBadSize, 1, 2048-(len("/copilot/")+len("/")+len("/secrets/"))),
+		},
+		"valid secret name": {
+			input: "secret.name",
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			got := validateSecretName(tc.input)
+			if tc.want != nil {
+				require.EqualError(t, got, tc.want.Error())
+			} else {
+				require.NoError(t, got)
+			}
+		})
+	}
+}
+
+func Test_validatePubSubTopicName(t *testing.T) {
+	testCases := map[string]struct {
+		inName string
+
+		wantErr error
+	}{
+		"valid topic name": {
+			inName: "a-Perfectly_V4l1dString",
+		},
+		"error when no topic name": {
+			inName:  "",
+			wantErr: errMissingPublishTopicField,
+		},
+		"error when invalid topic name": {
+			inName:  "OHNO~/`...,",
+			wantErr: errInvalidPubSubTopicName,
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			err := validatePubSubName(tc.inName)
+			if tc.wantErr == nil {
+				require.NoError(t, err)
+			} else {
+				require.EqualError(t, err, tc.wantErr.Error())
+			}
+		})
+	}
+}
+
+func Test_validateSubscriptionKey(t *testing.T) {
+	testCases := map[string]struct {
+		inSub interface{}
+
+		wantErr error
+	}{
+		"valid subscription": {
+			inSub:   "svc:topic",
+			wantErr: nil,
+		},
+		"error when non string": {
+			inSub:   true,
+			wantErr: errValueNotAString,
+		},
+		"error when bad format": {
+			inSub:   "svctopic",
+			wantErr: errSubscribeBadFormat,
+		},
+		"error when bad publisher name": {
+			inSub:   "svc:@@@@@@@h",
+			wantErr: fmt.Errorf("invalid topic subscription topic name `@@@@@@@h`: %w", errInvalidPubSubTopicName),
+		},
+		"error when bad svc name": {
+			inSub:   "n#######:topic",
+			wantErr: fmt.Errorf("invalid topic subscription service name `n#######`: %w", errBasicNameRegexNotMatched),
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			err := validateSubscriptionKey(tc.inSub)
+			if tc.wantErr == nil {
+				require.NoError(t, err)
+			} else {
+				require.EqualError(t, err, tc.wantErr.Error())
+			}
+		})
+	}
+}
+
+func Test_validateSubscribe(t *testing.T) {
+	testCases := map[string]struct {
+		inNoSubscriptions bool
+		inSubscribeTags   []string
+
+		wantErr error
+	}{
+		"valid subscription": {
+			inNoSubscriptions: false,
+			inSubscribeTags:   []string{"svc1:topic1", "svc2:topic2"},
+			wantErr:           nil,
+		},
+		"no error when no subscriptions": {
+			inNoSubscriptions: true,
+			inSubscribeTags:   nil,
+			wantErr:           nil,
+		},
+		"error when no-subscriptions and subscribe": {
+			inNoSubscriptions: true,
+			inSubscribeTags:   []string{"svc1:topic1", "svc2:topic2"},
+			wantErr:           errors.New("validate subscribe configuration: cannot specify both --no-subscribe and --subscribe-topics"),
+		},
+		"error when bad subscription tag": {
+			inNoSubscriptions: false,
+			inSubscribeTags:   []string{"svc:topic", "svc:@@@@@@@h"},
+			wantErr:           fmt.Errorf("invalid topic subscription topic name `@@@@@@@h`: %w", errInvalidPubSubTopicName),
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			err := validateSubscribe(tc.inNoSubscriptions, tc.inSubscribeTags)
+			if tc.wantErr == nil {
+				require.NoError(t, err)
+			} else {
+				require.EqualError(t, err, tc.wantErr.Error())
+			}
+		})
+	}
+}
+
+func TestValidateJobName(t *testing.T) {
+	testCases := map[string]struct {
+		val    interface{}
+		wanted error
+	}{
+		"string as input": {
+			val:    "hello",
+			wanted: nil,
+		},
+		"number as input": {
+			val:    1234,
+			wanted: errValueNotAString,
+		},
+		"is not a reserved name": {
+			val:    "pipelines",
+			wanted: errValueReserved,
+		},
+	}
+
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			got := validateJobName(tc.val)
+			require.True(t, errors.Is(got, tc.wanted), "got %v instead of %v", got, tc.wanted)
 		})
 	}
 }

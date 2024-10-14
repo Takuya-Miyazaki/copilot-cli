@@ -16,14 +16,23 @@ import (
 // Refer to https://en.wikipedia.org/wiki/ANSI_escape_code to validate if colors would
 // be visible on white or black screen backgrounds.
 var (
-	Grey         = color.New(color.FgWhite)
-	Red          = color.New(color.FgHiRed)
-	DullRed      = color.New(color.FgRed)
-	Green        = color.New(color.FgHiGreen)
-	Yellow       = color.New(color.FgHiYellow)
+	Grey     = color.New(color.FgWhite)
+	DarkGray = color.New(color.FgBlack)
+	Red      = color.New(color.FgHiRed)
+	DullRed  = color.New(color.FgRed)
+	Green    = color.New(color.FgHiGreen)
+	Yellow   = color.New(color.FgHiYellow)
+	Magenta  = color.New(color.FgMagenta)
+	Blue     = color.New(color.FgHiBlue)
+
+	DullGreen   = color.New(color.FgGreen)
+	DullBlue    = color.New(color.FgBlue)
+	DullYellow  = color.New(color.FgYellow)
+	DullMagenta = color.New(color.FgMagenta)
+	DullCyan    = color.New(color.FgCyan)
+
 	HiBlue       = color.New(color.FgHiBlue)
-	Cyan         = color.New(color.FgCyan)
-	HiCyan       = color.New(color.FgHiCyan)
+	Cyan         = color.New(color.FgHiCyan)
 	Bold         = color.New(color.Bold)
 	Faint        = color.New(color.Faint)
 	BoldFgYellow = color.New(color.FgYellow).Add(color.Bold)
@@ -75,12 +84,39 @@ func HighlightResource(s string) string {
 	return HiBlue.Sprint(s)
 }
 
-// HighlightCode wraps the string with the ` character, colors it to denote it's a code block, and returns it.
+// HighlightCode wraps the string s with the ` character, colors it to denote it's code, and returns it.
 func HighlightCode(s string) string {
-	return HiCyan.Sprintf("`%s`", s)
+	return Cyan.Sprintf("`%s`", s)
+}
+
+// HighlightCodeBlock wraps the string s with ``` characters, colors it to denote it's a multi-line code block, and returns it.
+func HighlightCodeBlock(s string) string {
+	return Cyan.Sprintf("```\n%s\n```", s)
 }
 
 // Prod colors the string to mark it is a prod environment.
 func Prod(s string) string {
 	return BoldFgYellow.Sprint(s)
+}
+
+// ColorGenerator returns a generator function for colors.
+// It doesn't return reds to avoid error-like formatting.
+func ColorGenerator() func() *color.Color {
+	colors := []*color.Color{
+		Yellow,
+		Green,
+		Cyan,
+		Blue,
+		Magenta,
+		DullYellow,
+		DullGreen,
+		DullCyan,
+		DullBlue,
+		DullMagenta,
+	}
+	i := 0
+	return func() *color.Color {
+		defer func() { i++ }()
+		return colors[i%len(colors)]
+	}
 }

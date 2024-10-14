@@ -5,15 +5,18 @@ package cli
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
+	"slices"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/service/ssm"
+	"github.com/aws/copilot-cli/internal/pkg/aws/identity"
+	"github.com/aws/copilot-cli/internal/pkg/version"
 
 	"github.com/aws/copilot-cli/internal/pkg/aws/sessions"
 	"github.com/aws/copilot-cli/internal/pkg/config"
-	"github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation"
-	"github.com/aws/copilot-cli/internal/pkg/deploy/cloudformation/stack"
+	"github.com/aws/copilot-cli/internal/pkg/exec"
 	"github.com/aws/copilot-cli/internal/pkg/manifest"
-	"github.com/aws/copilot-cli/internal/pkg/term/command"
 	"github.com/aws/copilot-cli/internal/pkg/term/prompt"
 	"github.com/aws/copilot-cli/internal/pkg/term/selector"
 	"github.com/aws/copilot-cli/internal/pkg/workspace"
@@ -27,23 +30,25 @@ const (
 )
 
 type packageJobVars struct {
-	name      string
-	envName   string
-	appName   string
-	tag       string
-	outputDir string
+	name               string
+	envName            string
+	appName            string
+	tag                string
+	outputDir          string
+	uploadAssets       bool
+	showDiff           bool
+	allowWkldDowngrade bool
 }
 
 type packageJobOpts struct {
 	packageJobVars
 
 	// Interfaces to interact with dependencies.
-	ws              wsJobDirReader
-	store           store
-	runner          runner
-	sel             wsSelector
-	prompt          prompter
-	stackSerializer func(mft interface{}, env *config.Environment, app *config.Application, rc stack.RuntimeConfig) (stackSerializer, error)
+	ws     wsJobDirReader
+	store  store
+	runner execRunner
+	sel    wsSelector
+	prompt prompter
 
 	// Subcommand implementing svc_package's Execute()
 	packageCmd    actionCommand
@@ -51,57 +56,53 @@ type packageJobOpts struct {
 }
 
 func newPackageJobOpts(vars packageJobVars) (*packageJobOpts, error) {
-	ws, err := workspace.New()
+	sessProvider := sessions.ImmutableProvider(sessions.UserAgentExtras("job package"))
+	defaultSess, err := sessProvider.Default()
 	if err != nil {
-		return nil, fmt.Errorf("new workspace: %w", err)
+		return nil, err
 	}
-	store, err := config.NewStore()
+	store := config.NewSSMStore(identity.New(defaultSess), ssm.New(defaultSess), aws.StringValue(defaultSess.Config.Region))
+	fs := afero.NewOsFs()
+	ws, err := workspace.Use(fs)
 	if err != nil {
-		return nil, fmt.Errorf("connect to config store: %w", err)
-	}
-	p := sessions.NewProvider()
-	sess, err := p.Default()
-	if err != nil {
-		return nil, fmt.Errorf("retrieve default session: %w", err)
+		return nil, err
 	}
 	prompter := prompt.New()
 	opts := &packageJobOpts{
 		packageJobVars: vars,
 		ws:             ws,
 		store:          store,
-		runner:         command.New(),
-		sel:            selector.NewWorkspaceSelect(prompter, store, ws),
+		runner:         exec.NewCmd(),
+		sel:            selector.NewLocalWorkloadSelector(prompter, store, ws, selector.OnlyInitializedWorkloads),
 		prompt:         prompter,
-	}
-
-	opts.stackSerializer = func(mft interface{}, env *config.Environment, app *config.Application, rc stack.RuntimeConfig) (stackSerializer, error) {
-		var serializer stackSerializer
-		jobMft := mft.(*manifest.ScheduledJob)
-		serializer, err := stack.NewScheduledJob(jobMft, env.Name, app.Name, rc)
-		if err != nil {
-			return nil, fmt.Errorf("init scheduled job stack serializer: %w", err)
-		}
-		return serializer, nil
 	}
 
 	opts.newPackageCmd = func(o *packageJobOpts) {
 		opts.packageCmd = &packageSvcOpts{
 			packageSvcVars: packageSvcVars{
-				name:      o.name,
-				envName:   o.envName,
-				appName:   o.appName,
-				tag:       o.tag,
-				outputDir: o.outputDir,
+				name:               o.name,
+				envName:            o.envName,
+				appName:            o.appName,
+				tag:                o.tag,
+				outputDir:          o.outputDir,
+				uploadAssets:       o.uploadAssets,
+				allowWkldDowngrade: o.allowWkldDowngrade,
+				showDiff:           o.showDiff,
 			},
-			initAddonsClient: initPackageAddonsClient,
-			ws:               ws,
-			store:            o.store,
-			appCFN:           cloudformation.New(sess),
-			stackWriter:      os.Stdout,
-			paramsWriter:     ioutil.Discard,
-			addonsWriter:     ioutil.Discard,
-			fs:               &afero.Afero{Fs: afero.NewOsFs()},
-			stackSerializer:  o.stackSerializer,
+			runner:            o.runner,
+			ws:                ws,
+			store:             o.store,
+			templateWriter:    os.Stdout,
+			unmarshal:         manifest.UnmarshalWorkload,
+			newInterpolator:   newManifestInterpolator,
+			paramsWriter:      discardFile{},
+			addonsWriter:      discardFile{},
+			diffWriter:        os.Stdout,
+			fs:                fs,
+			sessProvider:      sessProvider,
+			newStackGenerator: newWorkloadStackGenerator,
+			gitShortCommit:    imageTagFromGit(o.runner),
+			templateVersion:   version.LatestTemplateVersion(),
 		}
 	}
 	return opts, nil
@@ -113,11 +114,11 @@ func (o *packageJobOpts) Validate() error {
 		return errNoAppInWorkspace
 	}
 	if o.name != "" {
-		names, err := o.ws.JobNames()
+		names, err := o.ws.ListJobs()
 		if err != nil {
 			return fmt.Errorf("list jobs in the workspace: %w", err)
 		}
-		if !contains(o.name, names) {
+		if !slices.Contains(names, o.name) {
 			return fmt.Errorf("job '%s' does not exist in the workspace", o.name)
 		}
 	}
@@ -137,11 +138,6 @@ func (o *packageJobOpts) Ask() error {
 	if err := o.askEnvName(); err != nil {
 		return err
 	}
-	tag, err := askImageTag(o.tag, o.prompt, o.runner)
-	if err != nil {
-		return err
-	}
-	o.tag = tag
 	return nil
 }
 
@@ -149,6 +145,11 @@ func (o *packageJobOpts) Ask() error {
 func (o *packageJobOpts) Execute() error {
 	o.newPackageCmd(o)
 	return o.packageCmd.Execute()
+}
+
+// RecommendActions suggests recommended actions before the packaged template is used for deployment.
+func (o *packageJobOpts) RecommendActions() error {
+	return o.packageCmd.RecommendActions()
 }
 
 func (o *packageJobOpts) askJobName() error {
@@ -182,29 +183,24 @@ func buildJobPackageCmd() *cobra.Command {
 	vars := packageJobVars{}
 	cmd := &cobra.Command{
 		Use:   "package",
-		Short: "Prints the AWS CloudFormation template of a job.",
-		Long:  `Prints the CloudFormation template used to deploy a job to an environment.`,
+		Short: "Print the AWS CloudFormation template of a job.",
+		Long:  `Print the CloudFormation template used to deploy a job to an environment.`,
 		Example: `
   Print the CloudFormation template for the "report-generator" job parametrized for the "test" environment.
   /code $ copilot job package -n report-generator -e test
 
   Write the CloudFormation stack and configuration to a "infrastructure/" sub-directory instead of printing.
-  /code $ copilot job package -n report-generator -e test --output-dir ./infrastructure
-  /code $ ls ./infrastructure
-  /code report-generator-test.stack.yml      report-generator-test.params.yml`,
+  /startcodeblock
+  $ copilot job package -n report-generator -e test --output-dir ./infrastructure
+  $ ls ./infrastructure
+  report-generator-test.stack.yml      report-generator-test.params.yml
+  /endcodeblock`,
 		RunE: runCmdE(func(cmd *cobra.Command, args []string) error {
 			opts, err := newPackageJobOpts(vars)
 			if err != nil {
 				return err
 			}
-
-			if err := opts.Validate(); err != nil {
-				return err
-			}
-			if err := opts.Ask(); err != nil {
-				return err
-			}
-			return opts.Execute()
+			return run(opts)
 		}),
 	}
 	cmd.Flags().StringVarP(&vars.name, nameFlag, nameFlagShort, "", jobFlagDescription)
@@ -212,5 +208,11 @@ func buildJobPackageCmd() *cobra.Command {
 	cmd.Flags().StringVarP(&vars.appName, appFlag, appFlagShort, tryReadingAppName(), appFlagDescription)
 	cmd.Flags().StringVar(&vars.tag, imageTagFlag, "", imageTagFlagDescription)
 	cmd.Flags().StringVar(&vars.outputDir, stackOutputDirFlag, "", stackOutputDirFlagDescription)
+	cmd.Flags().BoolVar(&vars.uploadAssets, uploadAssetsFlag, false, uploadAssetsFlagDescription)
+	cmd.Flags().BoolVar(&vars.showDiff, diffFlag, false, diffFlagDescription)
+	cmd.Flags().BoolVar(&vars.allowWkldDowngrade, allowDowngradeFlag, false, allowDowngradeFlagDescription)
+
+	cmd.MarkFlagsMutuallyExclusive(diffFlag, stackOutputDirFlag)
+	cmd.MarkFlagsMutuallyExclusive(diffFlag, uploadAssetsFlag)
 	return cmd
 }

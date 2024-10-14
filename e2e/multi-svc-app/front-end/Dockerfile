@@ -1,6 +1,6 @@
 # We specify the base image we need for our
 # go application
-FROM golang:1.14 AS builder
+FROM public.ecr.aws/docker/library/golang:1.20 as builder
 # We create an /app directory within our
 # image that will hold our application source
 # files
@@ -29,9 +29,9 @@ RUN chmod +x ./e2e-service
 
 # Define a build argument which we'll override in the copilot manifest
 # and make available to the service through the environment
-ARG MAGIC_WORDS_ARG
-ENV MAGIC_WORDS=$MAGIC_WORDS_ARG
-RUN echo $MAGIC_WORDS
+ARG MAGIC_VERB_ARG
+ENV MAGIC_VERB=$MAGIC_VERB_ARG
+RUN echo $MAGIC_VERB
 
 # Start the service
 ENTRYPOINT ["./e2e-service"]

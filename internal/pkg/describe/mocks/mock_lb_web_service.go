@@ -5,37 +5,51 @@
 package mocks
 
 import (
-	cloudformation "github.com/aws/aws-sdk-go/service/cloudformation"
-	ecs "github.com/aws/copilot-cli/internal/pkg/aws/ecs"
-	gomock "github.com/golang/mock/gomock"
 	reflect "reflect"
+
+	gomock "github.com/golang/mock/gomock"
 )
 
-// MocksvcDescriber is a mock of svcDescriber interface
-type MocksvcDescriber struct {
+// MockenvDescriber is a mock of envDescriber interface.
+type MockenvDescriber struct {
 	ctrl     *gomock.Controller
-	recorder *MocksvcDescriberMockRecorder
+	recorder *MockenvDescriberMockRecorder
 }
 
-// MocksvcDescriberMockRecorder is the mock recorder for MocksvcDescriber
-type MocksvcDescriberMockRecorder struct {
-	mock *MocksvcDescriber
+// MockenvDescriberMockRecorder is the mock recorder for MockenvDescriber.
+type MockenvDescriberMockRecorder struct {
+	mock *MockenvDescriber
 }
 
-// NewMocksvcDescriber creates a new mock instance
-func NewMocksvcDescriber(ctrl *gomock.Controller) *MocksvcDescriber {
-	mock := &MocksvcDescriber{ctrl: ctrl}
-	mock.recorder = &MocksvcDescriberMockRecorder{mock}
+// NewMockenvDescriber creates a new mock instance.
+func NewMockenvDescriber(ctrl *gomock.Controller) *MockenvDescriber {
+	mock := &MockenvDescriber{ctrl: ctrl}
+	mock.recorder = &MockenvDescriberMockRecorder{mock}
 	return mock
 }
 
-// EXPECT returns an object that allows the caller to indicate expected use
-func (m *MocksvcDescriber) EXPECT() *MocksvcDescriberMockRecorder {
+// EXPECT returns an object that allows the caller to indicate expected use.
+func (m *MockenvDescriber) EXPECT() *MockenvDescriberMockRecorder {
 	return m.recorder
 }
 
-// Params mocks base method
-func (m *MocksvcDescriber) Params() (map[string]string, error) {
+// Outputs mocks base method.
+func (m *MockenvDescriber) Outputs() (map[string]string, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Outputs")
+	ret0, _ := ret[0].(map[string]string)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// Outputs indicates an expected call of Outputs.
+func (mr *MockenvDescriberMockRecorder) Outputs() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Outputs", reflect.TypeOf((*MockenvDescriber)(nil).Outputs))
+}
+
+// Params mocks base method.
+func (m *MockenvDescriber) Params() (map[string]string, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "Params")
 	ret0, _ := ret[0].(map[string]string)
@@ -43,68 +57,61 @@ func (m *MocksvcDescriber) Params() (map[string]string, error) {
 	return ret0, ret1
 }
 
-// Params indicates an expected call of Params
-func (mr *MocksvcDescriberMockRecorder) Params() *gomock.Call {
+// Params indicates an expected call of Params.
+func (mr *MockenvDescriberMockRecorder) Params() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Params", reflect.TypeOf((*MocksvcDescriber)(nil).Params))
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Params", reflect.TypeOf((*MockenvDescriber)(nil).Params))
 }
 
-// EnvOutputs mocks base method
-func (m *MocksvcDescriber) EnvOutputs() (map[string]string, error) {
+// ServiceDiscoveryEndpoint mocks base method.
+func (m *MockenvDescriber) ServiceDiscoveryEndpoint() (string, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "EnvOutputs")
-	ret0, _ := ret[0].(map[string]string)
+	ret := m.ctrl.Call(m, "ServiceDiscoveryEndpoint")
+	ret0, _ := ret[0].(string)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
-// EnvOutputs indicates an expected call of EnvOutputs
-func (mr *MocksvcDescriberMockRecorder) EnvOutputs() *gomock.Call {
+// ServiceDiscoveryEndpoint indicates an expected call of ServiceDiscoveryEndpoint.
+func (mr *MockenvDescriberMockRecorder) ServiceDiscoveryEndpoint() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "EnvOutputs", reflect.TypeOf((*MocksvcDescriber)(nil).EnvOutputs))
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ServiceDiscoveryEndpoint", reflect.TypeOf((*MockenvDescriber)(nil).ServiceDiscoveryEndpoint))
 }
 
-// EnvVars mocks base method
-func (m *MocksvcDescriber) EnvVars() ([]*ecs.ContainerEnvVar, error) {
+// MocklbDescriber is a mock of lbDescriber interface.
+type MocklbDescriber struct {
+	ctrl     *gomock.Controller
+	recorder *MocklbDescriberMockRecorder
+}
+
+// MocklbDescriberMockRecorder is the mock recorder for MocklbDescriber.
+type MocklbDescriberMockRecorder struct {
+	mock *MocklbDescriber
+}
+
+// NewMocklbDescriber creates a new mock instance.
+func NewMocklbDescriber(ctrl *gomock.Controller) *MocklbDescriber {
+	mock := &MocklbDescriber{ctrl: ctrl}
+	mock.recorder = &MocklbDescriberMockRecorder{mock}
+	return mock
+}
+
+// EXPECT returns an object that allows the caller to indicate expected use.
+func (m *MocklbDescriber) EXPECT() *MocklbDescriberMockRecorder {
+	return m.recorder
+}
+
+// ListenerRulesHostHeaders mocks base method.
+func (m *MocklbDescriber) ListenerRulesHostHeaders(ruleARNs []string) ([]string, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "EnvVars")
-	ret0, _ := ret[0].([]*ecs.ContainerEnvVar)
+	ret := m.ctrl.Call(m, "ListenerRulesHostHeaders", ruleARNs)
+	ret0, _ := ret[0].([]string)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
-// EnvVars indicates an expected call of EnvVars
-func (mr *MocksvcDescriberMockRecorder) EnvVars() *gomock.Call {
+// ListenerRulesHostHeaders indicates an expected call of ListenerRulesHostHeaders.
+func (mr *MocklbDescriberMockRecorder) ListenerRulesHostHeaders(ruleARNs interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "EnvVars", reflect.TypeOf((*MocksvcDescriber)(nil).EnvVars))
-}
-
-// Secrets mocks base method
-func (m *MocksvcDescriber) Secrets() ([]*ecs.ContainerSecret, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Secrets")
-	ret0, _ := ret[0].([]*ecs.ContainerSecret)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// Secrets indicates an expected call of Secrets
-func (mr *MocksvcDescriberMockRecorder) Secrets() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Secrets", reflect.TypeOf((*MocksvcDescriber)(nil).Secrets))
-}
-
-// ServiceStackResources mocks base method
-func (m *MocksvcDescriber) ServiceStackResources() ([]*cloudformation.StackResource, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "ServiceStackResources")
-	ret0, _ := ret[0].([]*cloudformation.StackResource)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// ServiceStackResources indicates an expected call of ServiceStackResources
-func (mr *MocksvcDescriberMockRecorder) ServiceStackResources() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ServiceStackResources", reflect.TypeOf((*MocksvcDescriber)(nil).ServiceStackResources))
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ListenerRulesHostHeaders", reflect.TypeOf((*MocklbDescriber)(nil).ListenerRulesHostHeaders), ruleARNs)
 }
